@@ -37,6 +37,9 @@ COGNITO_DOMAIN = os.environ["COGNITO_DOMAIN"]
 COGNITO_CLIENT_ID = os.environ["COGNITO_CLIENT_ID"]
 SESSION_TABLE_NAME = os.environ.get("SESSION_TABLE_NAME", "")
 
+# Allowed redirect_uri hosts for OAuth callback (prevent open redirect)
+_ALLOWED_REDIRECT_HOSTS = {"127.0.0.1", "localhost"}
+
 
 def lambda_handler(event, context):
     path = event.get("path", "") or event.get("rawPath", "/")
@@ -173,10 +176,20 @@ def handle_callback(event):
         original_state = decoded.get("state", "")
         original_redirect_uri = decoded.get("redirect_uri", "")
     except Exception as e:
-        return json_response(400, {"error": f"Invalid state: {e}"})
+        print(f"[CALLBACK] State decode error: {e}")
+        return json_response(400, {"error": "Invalid state parameter"})
 
     if not original_redirect_uri:
         return json_response(400, {"error": "Missing redirect_uri"})
+
+    # Validate redirect_uri against allowlist to prevent open redirect
+    try:
+        parsed = urllib.parse.urlparse(original_redirect_uri)
+        if parsed.hostname not in _ALLOWED_REDIRECT_HOSTS:
+            print(f"[CALLBACK] Blocked redirect to disallowed host: {parsed.hostname}")
+            return json_response(400, {"error": "Invalid redirect_uri"})
+    except Exception:
+        return json_response(400, {"error": "Invalid redirect_uri"})
 
     forward_params = urllib.parse.urlencode({
         "code": code,
@@ -220,7 +233,8 @@ def handle_token(event):
     except urllib.error.HTTPError as e:
         error_body = e.read().decode()
         print(f"[TOKEN] Cognito error {e.code}: {error_body}")
-        return json_response(e.code, {"error": error_body})
+        # Return generic error to client; details are logged server-side
+        return json_response(e.code, {"error": "token_exchange_failed"})
 
 
 # ─── 3LO Callback (CompleteResourceTokenAuth) ───────────────────────────────
@@ -294,10 +308,12 @@ def handle_3lo_callback(event):
     except urllib.error.HTTPError as e:
         error_body = e.read().decode()
         print(f"[3LO-CALLBACK] CompleteResourceTokenAuth error {e.code}: {error_body}")
-        return html_response(e.code, "Token exchange failed", error_body[:500])
+        return html_response(e.code, "Token exchange failed",
+                             "Authorization could not be completed. Check server logs for details.")
     except Exception as exc:
         print(f"[3LO-CALLBACK] Error: {exc}")
-        return html_response(500, "Token exchange failed", str(exc))
+        return html_response(500, "Token exchange failed",
+                             "An unexpected error occurred. Check server logs for details.")
 
 
 def html_response(code, title, detail):
@@ -474,7 +490,7 @@ def json_response(status_code, body):
         "statusCode": status_code,
         "headers": {
             "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin": "http://localhost",
             "Access-Control-Allow-Headers": "Content-Type,Authorization,Mcp-Protocol-Version,Mcp-Session-Id",
             "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
         },
@@ -486,7 +502,7 @@ def cors_ok():
     return {
         "statusCode": 200,
         "headers": {
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin": "http://localhost",
             "Access-Control-Allow-Headers": "Content-Type,Authorization,Mcp-Protocol-Version,Mcp-Session-Id",
             "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
         },

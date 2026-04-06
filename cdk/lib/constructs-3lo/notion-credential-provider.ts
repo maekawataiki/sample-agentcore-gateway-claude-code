@@ -79,8 +79,17 @@ export class NotionCredentialProviderConstruct extends Construct {
         },
         policy: cr.AwsCustomResourcePolicy.fromStatements([
           new iam.PolicyStatement({
-            actions: ["bedrock-agentcore:*", "secretsmanager:*"],
-            resources: ["*"],
+            actions: [
+              "bedrock-agentcore:CreateOauth2CredentialProvider",
+              "bedrock-agentcore:UpdateOauth2CredentialProvider",
+              "bedrock-agentcore:DeleteOauth2CredentialProvider",
+              "bedrock-agentcore:GetOauth2CredentialProvider",
+            ],
+            resources: [`arn:aws:bedrock-agentcore:${stack.region}:${stack.account}:*`],
+          }),
+          new iam.PolicyStatement({
+            actions: ["secretsmanager:CreateSecret", "secretsmanager:DeleteSecret", "secretsmanager:PutSecretValue"],
+            resources: [`arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:*`],
           }),
         ]),
         logRetention: logs.RetentionDays.ONE_WEEK,

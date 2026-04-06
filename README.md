@@ -3,6 +3,10 @@
 Amazon Bedrock AgentCore Gateway for Claude Code MCP integration.
 Single gateway with multiple targets (GitHub, Notion, Redash) — one Cognito login covers all tools.
 
+Based on the official AgentCore samples:
+- [IDE Gateway Tool (Serverless OAuth Proxy)](https://github.com/awslabs/agentcore-samples/tree/main/01-tutorials/02-AgentCore-gateway/04-integration/03-ide-gateway-tool) — OAuth proxy pattern for VS Code / Claude Code
+- [Fine-Grained Access Control](https://github.com/awslabs/agentcore-samples/tree/main/01-tutorials/02-AgentCore-gateway/09-fine-grained-access-control) — JWT-scope-based interceptor pattern
+
 ## Why a Single Gateway
 
 When AI agents call external APIs directly, credentials scatter, access control fragments, and audit becomes hard. A single AgentCore Gateway solves this:
@@ -16,16 +20,33 @@ When AI agents call external APIs directly, credentials scatter, access control 
 
 ![Architecture](docs/architecture.drawio.png)
 
-- **3LO OAuth Flow** (GitHub / Notion): Claude Code → OAuth Proxy → Cognito → AgentCore Gateway → Token Vault → External API
-- **API Key Swap Flow** (Redash): Claude Code → OAuth Proxy → AgentCore Gateway → REQUEST Interceptor (DynamoDB lookup) → External API
+### Why the OAuth Proxy (API Gateway) is needed
 
-### Operation Flow
+Claude Code's MCP client expects standard OAuth endpoints (`/.well-known/oauth-protected-resource`, `/authorize`, `/token`) at the MCP server URL. AgentCore Gateway validates incoming JWTs but does not act as an OAuth Authorization Server itself.
 
-![Operation Flow](docs/flow.png)
+The OAuth Proxy (Lambda behind API Gateway HTTP API) bridges this gap:
 
-- **Step 1**: Inbound Auth — Cognito login via OAuth Proxy
-- **Step 2-a**: Outbound 3LO Auth — GitHub/Notion OAuth consent via Token Vault
-- **Step 2-b**: API Key Exchange — Redash API Key injected transparently by REQUEST Interceptor
+1. **OAuth facade** — Serves RFC 9728 metadata and proxies `/authorize` + `/token` to Cognito, so Claude Code sees a spec-compliant OAuth server at the MCP URL
+2. **MCP forwarding** — Forwards MCP requests to AgentCore Gateway with the Cognito JWT attached
+3. **3LO callback handling** — Receives the OAuth callback after user consent (GitHub / Notion), calls `CompleteResourceTokenAuth` to bind the token to the user's identity
+
+```
+Claude Code ──► API Gateway (HTTP API)
+                  └─► OAuth Proxy Lambda
+                        ├─ /.well-known/*  → Cognito discovery
+                        ├─ /authorize      → Cognito hosted UI
+                        ├─ /token          → Cognito token endpoint
+                        ├─ /mcp            → AgentCore Gateway (JWT auth)
+                        └─ /3lo-callback   → CompleteResourceTokenAuth
+```
+
+### Auth Flows
+
+| Flow | Direction | When |
+|------|-----------|------|
+| **Inbound Auth** (Cognito) | Claude Code → OAuth Proxy → Cognito → JWT | On MCP server connection |
+| **Outbound 3LO** (GitHub / Notion) | AgentCore Gateway → SaaS OAuth → User consent → Token Vault | On first tool call to a 3LO target |
+| **API Key Swap** (Redash) | AgentCore Gateway → REQUEST Interceptor → DynamoDB lookup → inject header | On every Redash tool call |
 
 ### Stacks
 
@@ -40,6 +61,27 @@ When AI agents call external APIs directly, credentials scatter, access control 
 - An AWS account with Bedrock AgentCore access (us-east-1)
 - GitHub OAuth App (optional)
 - Notion Integration with OAuth (optional)
+
+## Configuration
+
+All parameters are defined in `cdk/bin/parameter.ts` and validated with Zod at synth time.
+
+```typescript
+// cdk/bin/parameter.ts
+export const params = ParameterSchema.parse({
+  awsAccount: process.env.CDK_DEFAULT_ACCOUNT || process.env.AWS_ACCOUNT_ID || '',
+  region: 'us-east-1',
+  cognitoDomainPrefix: 'remote-mcp-gateway',
+  deployRedash: true,
+  redashAdminUserId: 'you@example.com',    // ← edit this
+  githubClientId: process.env.GITHUB_OAUTH_CLIENT_ID || undefined,
+  githubClientSecret: process.env.GITHUB_OAUTH_CLIENT_SECRET || undefined,
+  notionClientId: process.env.NOTION_OAUTH_CLIENT_ID || undefined,
+  notionClientSecret: process.env.NOTION_OAUTH_CLIENT_SECRET || undefined,
+})
+```
+
+If a required field is missing or a client ID is set without its secret, `cdk synth` fails immediately with a Zod validation error.
 
 ## Deployment
 
@@ -60,7 +102,31 @@ npm install
 npx cdk deploy --all --require-approval never
 ```
 
-### 3. Create a Cognito user
+### 3. Retrieve Redash credentials (if `deployRedash: true`)
+
+Redash admin password and API key are generated at EC2 boot time and stored in Secrets Manager.
+
+```bash
+SECRET_NAME=$(aws cloudformation describe-stacks --stack-name GatewayStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`RedashCredentialsSecret`].OutputValue' --output text)
+
+aws secretsmanager get-secret-value --secret-id $SECRET_NAME \
+  --query SecretString --output text | jq .
+```
+
+Returns:
+```json
+{
+  "admin_email": "admin@redash.local",
+  "admin_password": "...",
+  "pg_password": "...",
+  "api_key": "..."
+}
+```
+
+> The EC2 instance takes a few minutes to complete setup. If the secret is empty, wait and retry.
+
+### 4. Create a Cognito user
 
 ```bash
 USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name CognitoStack \
@@ -80,7 +146,7 @@ aws cognito-idp admin-set-user-password \
   --permanent
 ```
 
-### 4. Set OAuth App callback URLs
+### 5. Set OAuth App callback URLs
 
 After deploy, get the credential provider callback URLs:
 
@@ -104,7 +170,7 @@ Set these URLs in your OAuth App settings:
 
 > These URLs change when the credential provider is recreated (stack delete + create).
 
-### 5. Configure `.mcp.json`
+### 6. Configure `.mcp.json`
 
 ```bash
 # Get the values
@@ -136,7 +202,7 @@ Add to your `.mcp.json`:
 
 One entry covers all tools (GitHub, Notion, Redash).
 
-### 6. Update gateway target `defaultReturnUrl` (3LO only)
+### 7. Update gateway target `defaultReturnUrl` (3LO only)
 
 The 3LO targets are created with a placeholder `defaultReturnUrl`.
 After deploy, update them to point to the proxy's `/3lo-callback` endpoint:
@@ -176,7 +242,7 @@ aws bedrock-agentcore-control update-gateway-target \
 | File | Description |
 |------|-------------|
 | `cdk/bin/mcp-3lo-runtime-stack.ts` | CDK app entry point |
-| `cdk/bin/parameter.ts` | Deployment parameters |
+| `cdk/bin/parameter.ts` | Deployment parameters (Zod-validated) |
 | `cdk/lib/cognito-stack.ts` | Shared Cognito User Pool |
 | `cdk/lib/gateway-stack.ts` | Unified Gateway + all targets + OAuth Proxy |
 | `cdk/lib/constructs-3lo/` | 3LO credential provider constructs (GitHub, Notion) |
@@ -188,6 +254,16 @@ aws bedrock-agentcore-control update-gateway-target \
 | `cdk/openapi/github-api.yaml` | GitHub API OpenAPI spec |
 | `cdk/openapi/notion-api.yaml` | Notion API OpenAPI spec |
 | `cdk/openapi/redash-api.yaml` | Redash API OpenAPI spec |
+| `cdk/test/nag.test.ts` | cdk-nag security compliance tests |
+
+## Testing
+
+```bash
+cd cdk
+npm test
+```
+
+Runs [cdk-nag](https://github.com/cdklabs/cdk-nag) AwsSolutions checks against both stacks. Any new security finding will fail the test unless explicitly suppressed with a documented reason in `test/nag.test.ts`.
 
 ## Troubleshooting
 

@@ -3,7 +3,7 @@ import 'source-map-support/register'
 import * as cdk from 'aws-cdk-lib'
 import { CognitoStack } from '../lib/cognito-stack'
 import { GatewayStack } from '../lib/gateway-stack'
-import * as params from './parameter'
+import { params } from './parameter'
 
 const app = new cdk.App()
 const env = { account: params.awsAccount, region: params.region }
@@ -21,15 +21,12 @@ new GatewayStack(app, 'GatewayStack', {
   cognitoClientId: cognito.appClientId,
   cognitoDomain: cognito.cognitoDomain,
   cognitoUserPoolId: cognito.userPoolId,
-  // GitHub 3LO (set env vars to enable)
-  githubClientId: params.githubClientId || undefined,
-  githubClientSecret: params.githubClientSecret || undefined,
-  // Notion 3LO (set env vars to enable)
-  notionClientId: params.notionClientId || undefined,
-  notionClientSecret: params.notionClientSecret || undefined,
-  // Redash
+  githubClientId: params.githubClientId,
+  githubClientSecret: params.githubClientSecret,
+  notionClientId: params.notionClientId,
+  notionClientSecret: params.notionClientSecret,
   deployRedash: params.deployRedash,
-  redashUrl: params.redashUrl || undefined,
+  redashUrl: params.redashUrl,
   redashAdminUserId: params.redashAdminUserId,
   env,
   description: 'Unified MCP Gateway — GitHub, Notion, Redash via single endpoint',

@@ -35,7 +35,7 @@ export class CognitoStack extends cdk.Stack {
     // ── User Pool ──
     this.userPool = new cognito.UserPool(this, 'UserPool', {
       userPoolName: 'remote-mcp-users',
-      selfSignUpEnabled: true,
+      selfSignUpEnabled: false,
       signInAliases: { email: true },
       standardAttributes: {
         email: { required: true, mutable: false },

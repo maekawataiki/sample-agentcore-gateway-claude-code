@@ -31,19 +31,34 @@ apikey_table = dynamodb.Table(APIKEY_TABLE_NAME)
 
 
 def _extract_caller_id(req: dict[str, Any]) -> str:
-    """Extract caller identity from JWT Bearer token."""
+    """Extract caller identity from JWT Bearer token.
+
+    Security note: This interceptor runs inside AgentCore Gateway, which has
+    already verified the JWT signature via CUSTOM_JWT auth (Cognito JWKS).
+    We decode the payload without re-verifying the signature to avoid the
+    latency of fetching JWKS on every request. The token reaching this point
+    has been authenticated by the gateway.
+    """
     headers = req.get("headers", {})
     auth_header = headers.get("Authorization", "") or headers.get("authorization", "")
 
     if auth_header.startswith("Bearer "):
         try:
             token = auth_header.split(" ", 1)[1]
-            payload = token.split(".")[1]
+            parts = token.split(".")
+            if len(parts) != 3:
+                print("[APIKEY_INTERCEPTOR] Malformed JWT: expected 3 parts")
+                return ""
+            payload = parts[1]
             payload += "=" * (4 - len(payload) % 4)
             claims = json.loads(base64.b64decode(payload))
-            return claims.get("username", "") or claims.get("sub", "")
-        except Exception:
-            pass
+            caller = claims.get("username", "") or claims.get("sub", "")
+            if not caller or not isinstance(caller, str) or len(caller) > 256:
+                print("[APIKEY_INTERCEPTOR] Invalid caller claim")
+                return ""
+            return caller
+        except Exception as e:
+            print(f"[APIKEY_INTERCEPTOR] JWT decode error: {e}")
     return ""
 
 
@@ -134,4 +149,4 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return _build_pass_through(body)
     except Exception as e:
         print(f"[APIKEY_INTERCEPTOR] Error: {e}")
-        return _build_error(f"API key lookup failed: {e}", body)
+        return _build_error("API key lookup failed", body)

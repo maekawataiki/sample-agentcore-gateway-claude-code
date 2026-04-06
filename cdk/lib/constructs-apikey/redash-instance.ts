@@ -5,6 +5,7 @@ import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as targets from "aws-cdk-lib/aws-elasticloadbalancingv2-targets";
+import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { Construct } from "constructs";
 
 export interface RedashInstanceConstructProps {
@@ -30,6 +31,8 @@ export class RedashInstanceConstruct extends Construct {
   public readonly instance: ec2.Instance;
   /** HTTPS URL for the Redash API (via API Gateway proxy) */
   public readonly redashUrl: string;
+  /** Secrets Manager secret name containing Redash credentials */
+  public readonly credentialsSecretName: string;
   public readonly vpc: ec2.IVpc;
 
   constructor(
@@ -87,6 +90,13 @@ export class RedashInstanceConstruct extends Construct {
     });
     props.apiKeyTable.grantWriteData(role);
 
+    // ── Secrets Manager for Redash credentials ──
+    const redashSecret = new secretsmanager.Secret(this, "RedashSecret", {
+      secretName: `redash-credentials-${stack.stackName}`,
+      description: "Redash admin credentials (generated at EC2 boot time)",
+    });
+    redashSecret.grantWrite(role);
+
     // ── UserData ──
     const userData = ec2.UserData.forLinux();
     userData.addCommands(
@@ -102,9 +112,15 @@ export class RedashInstanceConstruct extends Construct {
       'curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${ARCH}" -o /usr/local/bin/docker-compose',
       "chmod +x /usr/local/bin/docker-compose",
 
+      // Generate random secrets at boot time
+      'PG_PASSWORD=$(tr -dc "A-Za-z0-9" < /dev/urandom | head -c 32)',
+      'COOKIE_SECRET=$(tr -dc "A-Za-z0-9" < /dev/urandom | head -c 48)',
+      'SECRET_KEY=$(tr -dc "A-Za-z0-9" < /dev/urandom | head -c 48)',
+      'ADMIN_PASSWORD=$(tr -dc "A-Za-z0-9!@#$" < /dev/urandom | head -c 24)',
+
       // Create docker-compose.yml
       "mkdir -p /opt/redash",
-      `cat > /opt/redash/docker-compose.yml << 'COMPOSEFILE'
+      `cat > /opt/redash/docker-compose.yml << COMPOSEFILE
 version: "3"
 services:
   server:
@@ -112,10 +128,10 @@ services:
     depends_on: [postgres, redis]
     ports: ["5000:5000"]
     environment:
-      REDASH_DATABASE_URL: "postgresql://postgres:postgres@postgres/postgres"
+      REDASH_DATABASE_URL: "postgresql://postgres:$PG_PASSWORD@postgres/postgres"
       REDASH_REDIS_URL: "redis://redis:6379/0"
-      REDASH_COOKIE_SECRET: "redash-cookie-secret-change-me"
-      REDASH_SECRET_KEY: "redash-secret-key-change-me"
+      REDASH_COOKIE_SECRET: "$COOKIE_SECRET"
+      REDASH_SECRET_KEY: "$SECRET_KEY"
       REDASH_WEB_WORKERS: 2
     command: server
     restart: always
@@ -123,7 +139,7 @@ services:
     image: redash/redash:10.1.0.b50633
     depends_on: [server]
     environment:
-      REDASH_DATABASE_URL: "postgresql://postgres:postgres@postgres/postgres"
+      REDASH_DATABASE_URL: "postgresql://postgres:$PG_PASSWORD@postgres/postgres"
       REDASH_REDIS_URL: "redis://redis:6379/0"
     command: scheduler
     restart: always
@@ -131,7 +147,7 @@ services:
     image: redash/redash:10.1.0.b50633
     depends_on: [server]
     environment:
-      REDASH_DATABASE_URL: "postgresql://postgres:postgres@postgres/postgres"
+      REDASH_DATABASE_URL: "postgresql://postgres:$PG_PASSWORD@postgres/postgres"
       REDASH_REDIS_URL: "redis://redis:6379/0"
       QUEUES: "queries,scheduled_queries,celery"
       WORKERS_COUNT: 2
@@ -143,7 +159,7 @@ services:
   postgres:
     image: postgres:15-alpine
     environment:
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: $PG_PASSWORD
       POSTGRES_DB: postgres
     volumes: [postgres-data:/var/lib/postgresql/data]
     restart: always
@@ -166,26 +182,25 @@ COMPOSEFILE`,
   sleep 5
 done`,
 
-      // Setup admin user
+      // Setup admin user (password generated at boot)
       `curl -s -c /tmp/cookies.txt \\
   -H "Content-Type: application/json" \\
-  -d '{"name":"Admin","email":"admin@redash.local","password":"Admin123!","org_name":"Default"}' \\
+  -d '{"name":"Admin","email":"admin@redash.local","password":"'"$ADMIN_PASSWORD"'","org_name":"Default"}' \\
   http://localhost:5000/setup`,
 
       // Login to get session
       `curl -s -b /tmp/cookies.txt -c /tmp/cookies.txt \\
   -H "Content-Type: application/json" \\
-  -d '{"email":"admin@redash.local","password":"Admin123!"}' \\
+  -d '{"email":"admin@redash.local","password":"'"$ADMIN_PASSWORD"'"}' \\
   http://localhost:5000/api/session`,
 
       // Get API key
       `API_KEY=$(curl -s -b /tmp/cookies.txt http://localhost:5000/api/users/1 | jq -r '.api_key')`,
-      'echo "Redash Admin API Key: $API_KEY"',
 
       // Create data source (Redash's own PostgreSQL for demo queries)
       `curl -s -H "Authorization: Key $API_KEY" \\
   -H "Content-Type: application/json" \\
-  -d '{"name":"Sample DB","type":"pg","options":{"host":"postgres","port":5432,"dbname":"postgres","user":"postgres","password":"postgres"}}' \\
+  -d '{"name":"Sample DB","type":"pg","options":{"host":"postgres","port":5432,"dbname":"postgres","user":"postgres","password":"'"$PG_PASSWORD"'"}}' \\
   http://localhost:5000/api/data_sources`,
 
       // Write API key to DynamoDB
@@ -194,6 +209,19 @@ done`,
   --item '{"userId":{"S":"${props.adminUserId}"},"apiKey":{"S":"Key '"$API_KEY"'"},"headerName":{"S":"Authorization"},"serviceName":{"S":"redash"}}' \\
   --region "${stack.region}"`,
 
+      // Store credentials in Secrets Manager
+      `aws secretsmanager put-secret-value \\
+  --secret-id "${redashSecret.secretName}" \\
+  --secret-string "$(jq -n \\
+    --arg admin_email "admin@redash.local" \\
+    --arg admin_password "$ADMIN_PASSWORD" \\
+    --arg pg_password "$PG_PASSWORD" \\
+    --arg api_key "$API_KEY" \\
+    '{admin_email: $admin_email, admin_password: $admin_password, pg_password: $pg_password, api_key: $api_key}')" \\
+  --region "${stack.region}"`,
+
+      // Clean up sensitive temp files
+      'rm -f /tmp/cookies.txt',
       'echo "Redash setup complete"'
     );
 
@@ -212,11 +240,13 @@ done`,
       role,
       userData,
       associatePublicIpAddress: false,
+      requireImdsv2: true,
       blockDevices: [
         {
           deviceName: "/dev/xvda",
           volume: ec2.BlockDeviceVolume.ebs(30, {
             volumeType: ec2.EbsDeviceVolumeType.GP3,
+            encrypted: true,
           }),
         },
       ],
@@ -284,5 +314,6 @@ done`,
 
     // HTTPS URL (e.g. https://xxxxx.execute-api.us-east-1.amazonaws.com)
     this.redashUrl = httpApi.apiEndpoint;
+    this.credentialsSecretName = redashSecret.secretName;
   }
 }

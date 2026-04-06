@@ -1,31 +1,50 @@
 /**
  * Deployment parameters.
  *
- * Edit this file to change settings.
+ * All configuration is validated with Zod at synth time.
  * OAuth secrets fall back to environment variables so they don't need to be committed.
  */
+import { z } from 'zod'
 
-// ── AWS Account / Region ──
-export const awsAccount = process.env.CDK_DEFAULT_ACCOUNT || process.env.AWS_ACCOUNT_ID
-// AgentCore Gateway is available in us-east-1
-export const region = 'us-east-1'
+const ParameterSchema = z.object({
+  // ── AWS Account / Region ──
+  awsAccount: z.string().min(1, 'Set CDK_DEFAULT_ACCOUNT or AWS_ACCOUNT_ID'),
+  region: z.string().default('us-east-1'),
 
-// ── Cognito ──
-// Hosted UI domain prefix (must be globally unique across all AWS accounts)
-export const cognitoDomainPrefix = 'remote-mcp-gateway'
+  // ── Cognito ──
+  cognitoDomainPrefix: z.string().min(1),
 
-// ── FGAC Gateway ──
-export const fgacAdminStackName = 'LakeformationAdminStack'
+  // ── Redash / API Key Swap ──
+  deployRedash: z.boolean().default(true),
+  redashUrl: z.string().optional(),
+  redashAdminUserId: z.string().min(1),
 
-// ── API Key Swap / Redash ──
-export const deployRedash = true
-export const redashUrl = ''
-export const redashAdminUserId = 'tmae@amazon.com'
+  // ── GitHub 3LO (optional) ──
+  githubClientId: z.string().optional(),
+  githubClientSecret: z.string().optional(),
 
-// ── GitHub 3LO ──
-export const githubClientId = process.env.GITHUB_OAUTH_CLIENT_ID || ''
-export const githubClientSecret = process.env.GITHUB_OAUTH_CLIENT_SECRET || ''
+  // ── Notion 3LO (optional) ──
+  notionClientId: z.string().optional(),
+  notionClientSecret: z.string().optional(),
+}).refine(
+  (p) => !p.githubClientId || p.githubClientSecret,
+  { message: 'githubClientSecret is required when githubClientId is set' },
+).refine(
+  (p) => !p.notionClientId || p.notionClientSecret,
+  { message: 'notionClientSecret is required when notionClientId is set' },
+)
 
-// ── Notion 3LO ──
-export const notionClientId = process.env.NOTION_OAUTH_CLIENT_ID || ''
-export const notionClientSecret = process.env.NOTION_OAUTH_CLIENT_SECRET || ''
+export type Parameters = z.infer<typeof ParameterSchema>
+
+export const params: Parameters = ParameterSchema.parse({
+  awsAccount: process.env.CDK_DEFAULT_ACCOUNT || process.env.AWS_ACCOUNT_ID || '',
+  region: 'us-east-1',
+  cognitoDomainPrefix: 'remote-mcp-gateway',
+  deployRedash: true,
+  redashUrl: undefined,
+  redashAdminUserId: 'tmae@amazon.com',
+  githubClientId: process.env.GITHUB_OAUTH_CLIENT_ID || undefined,
+  githubClientSecret: process.env.GITHUB_OAUTH_CLIENT_SECRET || undefined,
+  notionClientId: process.env.NOTION_OAUTH_CLIENT_ID || undefined,
+  notionClientSecret: process.env.NOTION_OAUTH_CLIENT_SECRET || undefined,
+})

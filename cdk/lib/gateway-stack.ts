@@ -70,6 +70,10 @@ export class GatewayStack extends cdk.Stack {
       })
       redashBackendUrl = redash.redashUrl
       new cdk.CfnOutput(this, 'RedashUrl', { value: redash.redashUrl })
+      new cdk.CfnOutput(this, 'RedashCredentialsSecret', {
+        value: redash.credentialsSecretName,
+        description: 'aws secretsmanager get-secret-value --secret-id <this> --query SecretString --output text',
+      })
     } else if (props.redashUrl) {
       redashBackendUrl = props.redashUrl.replace(/\/$/, '')
     } else {
@@ -124,13 +128,37 @@ export class GatewayStack extends cdk.Stack {
       }),
       inlinePolicies: {
         AgentCorePolicy: new iam.PolicyDocument({
-          statements: [new iam.PolicyStatement({
-            actions: [
-              'bedrock-agentcore:*', 'bedrock:*', 'agent-credential-provider:*',
-              'iam:PassRole', 'secretsmanager:GetSecretValue', 'lambda:InvokeFunction',
-            ],
-            resources: ['*'],
-          })],
+          statements: [
+            new iam.PolicyStatement({
+              actions: [
+                'bedrock-agentcore:InvokeGateway',
+                'bedrock-agentcore:GetGateway',
+                'bedrock-agentcore:GetGatewayTarget',
+                'bedrock-agentcore:ListGatewayTargets',
+                'bedrock-agentcore:GetOauth2CredentialProvider',
+                'bedrock-agentcore:GetApiKeyCredentialProvider',
+                'bedrock-agentcore:CompleteResourceTokenAuth',
+              ],
+              resources: [`arn:aws:bedrock-agentcore:${this.region}:${this.account}:*`],
+            }),
+            new iam.PolicyStatement({
+              actions: ['iam:PassRole'],
+              resources: ['*'],
+              conditions: {
+                StringEquals: {
+                  'iam:PassedToService': 'bedrock-agentcore.amazonaws.com',
+                },
+              },
+            }),
+            new iam.PolicyStatement({
+              actions: ['secretsmanager:GetSecretValue'],
+              resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`],
+            }),
+            new iam.PolicyStatement({
+              actions: ['lambda:InvokeFunction'],
+              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:*`],
+            }),
+          ],
         }),
       },
     })
@@ -190,8 +218,16 @@ export class GatewayStack extends cdk.Stack {
       },
       policy: cr.AwsCustomResourcePolicy.fromStatements([
         new iam.PolicyStatement({
-          actions: ['bedrock-agentcore:*', 'secretsmanager:*'],
-          resources: ['*'],
+          actions: [
+            'bedrock-agentcore:CreateApiKeyCredentialProvider',
+            'bedrock-agentcore:DeleteApiKeyCredentialProvider',
+            'bedrock-agentcore:GetApiKeyCredentialProvider',
+          ],
+          resources: [`arn:aws:bedrock-agentcore:${this.region}:${this.account}:*`],
+        }),
+        new iam.PolicyStatement({
+          actions: ['secretsmanager:CreateSecret', 'secretsmanager:DeleteSecret', 'secretsmanager:PutSecretValue'],
+          resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`],
         }),
       ]),
       logRetention: logs.RetentionDays.ONE_WEEK,
@@ -293,6 +329,7 @@ export class GatewayStack extends cdk.Stack {
       tableName: `3lo-sessions-${this.stackName}`,
       partitionKey: { name: 'sessionUri', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
       timeToLiveAttribute: 'ttl',
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     })
@@ -320,19 +357,16 @@ export class GatewayStack extends cdk.Stack {
       logRetention: logs.RetentionDays.ONE_WEEK,
     })
     proxyLambda.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['bedrock-agentcore:CompleteResourceTokenAuth', 'secretsmanager:GetSecretValue'],
-      resources: ['*'],
+      actions: ['bedrock-agentcore:CompleteResourceTokenAuth'],
+      resources: [`arn:aws:bedrock-agentcore:${this.region}:${this.account}:*`],
     }))
     sessionTable.grantReadWriteData(proxyLambda)
 
+    // No CORS preflight — MCP clients (Claude Code, VS Code) are not browsers.
+    // The OAuth Proxy Lambda handles OPTIONS directly if needed.
     const httpApi = new apigwv2.HttpApi(this, 'ProxyApi', {
       apiName: 'unified-mcp-proxy',
       description: 'Unified MCP OAuth proxy for all Gateway targets',
-      corsPreflight: {
-        allowOrigins: ['*'],
-        allowMethods: [apigwv2.CorsHttpMethod.ANY],
-        allowHeaders: ['Content-Type', 'Authorization', 'Mcp-Protocol-Version', 'Mcp-Session-Id'],
-      },
     })
     const integration = new apigwv2integrations.HttpLambdaIntegration('Int', proxyLambda)
     httpApi.addRoutes({ path: '/{proxy+}', methods: [apigwv2.HttpMethod.ANY], integration })
