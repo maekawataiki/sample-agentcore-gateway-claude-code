@@ -1,0 +1,366 @@
+openapi: 3.0.3
+info:
+  title: Notion API (Minimal subset for AgentCore Gateway)
+  version: "2022-06-28"
+  description: |
+    Minimal OpenAPI spec for Notion API, targeting AgentCore Gateway 3LO verification.
+    Covers: search, pages, databases, blocks.
+
+servers:
+  - url: https://api.notion.com
+
+security:
+  - bearer: []
+
+paths:
+  /v1/search:
+    post:
+      operationId: search
+      summary: Search pages and databases by title
+      parameters:
+        - $ref: "#/components/parameters/NotionVersion"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query:
+                  type: string
+                  description: Text to search for in page/database titles
+                filter:
+                  type: object
+                  properties:
+                    property:
+                      type: string
+                      enum: [object]
+                    value:
+                      type: string
+                      enum: [page, data_source]
+                sort:
+                  type: object
+                  properties:
+                    timestamp:
+                      type: string
+                      enum: [last_edited_time]
+                    direction:
+                      type: string
+                      enum: [ascending, descending]
+                start_cursor:
+                  type: string
+                page_size:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedList"
+
+  /v1/pages/{page_id}:
+    get:
+      operationId: getPage
+      summary: Retrieve a page by ID
+      parameters:
+        - $ref: "#/components/parameters/NotionVersion"
+        - name: page_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Page object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Page"
+    patch:
+      operationId: updatePage
+      summary: Update page properties
+      parameters:
+        - $ref: "#/components/parameters/NotionVersion"
+        - name: page_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                properties:
+                  type: object
+                  description: Property values to update
+                archived:
+                  type: boolean
+      responses:
+        "200":
+          description: Updated page object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Page"
+
+  /v1/pages:
+    post:
+      operationId: createPage
+      summary: Create a new page
+      parameters:
+        - $ref: "#/components/parameters/NotionVersion"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - parent
+                - properties
+              properties:
+                parent:
+                  type: object
+                  description: "Parent page or database: {page_id: ...} or {database_id: ...}"
+                properties:
+                  type: object
+                  description: Page property values
+                children:
+                  type: array
+                  description: Page content as block objects
+                  items:
+                    type: object
+      responses:
+        "200":
+          description: Created page object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Page"
+
+  /v1/databases/{database_id}:
+    get:
+      operationId: getDatabase
+      summary: Retrieve a database by ID
+      parameters:
+        - $ref: "#/components/parameters/NotionVersion"
+        - name: database_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Database object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Database"
+
+  /v1/databases/{database_id}/query:
+    post:
+      operationId: queryDatabase
+      summary: Query a database with filters and sorts
+      parameters:
+        - $ref: "#/components/parameters/NotionVersion"
+        - name: database_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter:
+                  type: object
+                  description: Filter conditions (compound or property filters)
+                sorts:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      property:
+                        type: string
+                      direction:
+                        type: string
+                        enum: [ascending, descending]
+                start_cursor:
+                  type: string
+                page_size:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+      responses:
+        "200":
+          description: Query results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedList"
+
+  /v1/blocks/{block_id}/children:
+    get:
+      operationId: getBlockChildren
+      summary: List child blocks of a parent block or page
+      parameters:
+        - $ref: "#/components/parameters/NotionVersion"
+        - name: block_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: start_cursor
+          in: query
+          schema:
+            type: string
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: List of block children
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedList"
+    patch:
+      operationId: appendBlockChildren
+      summary: Append child blocks to a parent block or page
+      parameters:
+        - $ref: "#/components/parameters/NotionVersion"
+        - name: block_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - children
+              properties:
+                children:
+                  type: array
+                  items:
+                    type: object
+                  description: Block objects to append
+      responses:
+        "200":
+          description: Updated block children
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedList"
+
+  /v1/users/me:
+    get:
+      operationId: getMe
+      summary: Get the current bot user (useful for verifying OAuth token)
+      parameters:
+        - $ref: "#/components/parameters/NotionVersion"
+      responses:
+        "200":
+          description: Bot user object
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object:
+                    type: string
+                  id:
+                    type: string
+                  type:
+                    type: string
+                  name:
+                    type: string
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: Notion OAuth access token
+
+  parameters:
+    NotionVersion:
+      name: Notion-Version
+      in: header
+      required: true
+      schema:
+        type: string
+        default: "2022-06-28"
+      description: Notion API version
+
+  schemas:
+    PaginatedList:
+      type: object
+      properties:
+        object:
+          type: string
+          enum: [list]
+        results:
+          type: array
+          items:
+            type: object
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+
+    Page:
+      type: object
+      properties:
+        object:
+          type: string
+          enum: [page]
+        id:
+          type: string
+        created_time:
+          type: string
+          format: date-time
+        last_edited_time:
+          type: string
+          format: date-time
+        archived:
+          type: boolean
+        url:
+          type: string
+        properties:
+          type: object
+
+    Database:
+      type: object
+      properties:
+        object:
+          type: string
+          enum: [database]
+        id:
+          type: string
+        title:
+          type: array
+          items:
+            type: object
+        description:
+          type: array
+          items:
+            type: object
+        properties:
+          type: object

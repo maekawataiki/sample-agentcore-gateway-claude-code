@@ -1,0 +1,364 @@
+openapi: 3.0.3
+info:
+  title: Redash API
+  version: "1.0.0"
+  description: |
+    Redash REST API for data querying and dashboard access.
+    Authentication via Authorization: Key <api_key> header.
+
+servers:
+  - url: ${RedashUrl}
+
+security:
+  - redashApiKey: []
+
+paths:
+  /api/data_sources:
+    get:
+      operationId: listDataSources
+      summary: List available data sources
+      description: Returns all data sources the user has access to.
+      responses:
+        "200":
+          description: List of data sources
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: integer
+                    name:
+                      type: string
+                    type:
+                      type: string
+
+  /api/data_sources/{id}/schema:
+    get:
+      operationId: getDataSourceSchema
+      summary: Get schema for a data source
+      description: Returns table and column information for the specified data source.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Data source schema
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schema:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                          description: Table name
+                        columns:
+                          type: array
+                          items:
+                            type: string
+
+  /api/queries:
+    get:
+      operationId: listQueries
+      summary: List saved queries
+      description: Returns paginated list of saved queries.
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 25
+      responses:
+        "200":
+          description: Paginated query list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  page:
+                    type: integer
+                  page_size:
+                    type: integer
+                  results:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Query"
+    post:
+      operationId: createQuery
+      summary: Create a new saved query
+      description: Creates a new query and optionally executes it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [data_source_id, name, query]
+              properties:
+                data_source_id:
+                  type: integer
+                  description: ID of the data source to query
+                name:
+                  type: string
+                  description: Name for this saved query
+                query:
+                  type: string
+                  description: SQL query text
+                description:
+                  type: string
+      responses:
+        "200":
+          description: Created query
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Query"
+
+  /api/queries/{id}:
+    get:
+      operationId: getQuery
+      summary: Get a specific query
+      description: Returns details of a saved query including its latest result.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Query details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Query"
+
+  /api/queries/{id}/results:
+    post:
+      operationId: executeQuery
+      summary: Execute a saved query
+      description: Triggers execution of a saved query and returns the result.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                parameters:
+                  type: object
+                  description: Query parameter values
+                  additionalProperties: true
+      responses:
+        "200":
+          description: Query execution result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResult"
+
+  /api/query_results:
+    post:
+      operationId: executeAdhocQuery
+      summary: Execute an ad-hoc query
+      description: Executes a SQL query directly without saving it. Best for one-off data exploration.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [data_source_id, query]
+              properties:
+                data_source_id:
+                  type: integer
+                  description: ID of the data source to query
+                query:
+                  type: string
+                  description: SQL query to execute
+                max_age:
+                  type: integer
+                  description: Maximum age of cached result in seconds (0 = no cache)
+                  default: 0
+      responses:
+        "200":
+          description: Query result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResult"
+
+  /api/dashboards:
+    get:
+      operationId: listDashboards
+      summary: List dashboards
+      description: Returns paginated list of dashboards.
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 25
+      responses:
+        "200":
+          description: Paginated dashboard list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  page:
+                    type: integer
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                        name:
+                          type: string
+                        slug:
+                          type: string
+                        tags:
+                          type: array
+                          items:
+                            type: string
+
+  /api/dashboards/{slug}:
+    get:
+      operationId: getDashboard
+      summary: Get a specific dashboard
+      description: Returns dashboard details including its widgets and visualizations.
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Dashboard details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  name:
+                    type: string
+                  slug:
+                    type: string
+                  widgets:
+                    type: array
+                    items:
+                      type: object
+
+components:
+  schemas:
+    Query:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        query:
+          type: string
+          description: SQL query text
+        data_source_id:
+          type: integer
+        description:
+          type: string
+        schedule:
+          type: object
+          nullable: true
+        tags:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    QueryResult:
+      type: object
+      properties:
+        query_result:
+          type: object
+          properties:
+            id:
+              type: integer
+            data_source_id:
+              type: integer
+            query:
+              type: string
+            query_hash:
+              type: string
+            retrieved_at:
+              type: string
+              format: date-time
+            runtime:
+              type: number
+              description: Query execution time in seconds
+            data:
+              type: object
+              properties:
+                columns:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      friendly_name:
+                        type: string
+                      type:
+                        type: string
+                rows:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: true
+
+  securitySchemes:
+    redashApiKey:
+      type: apiKey
+      name: Authorization
+      in: header
+      description: "Redash API key in format: Key <api_key>"

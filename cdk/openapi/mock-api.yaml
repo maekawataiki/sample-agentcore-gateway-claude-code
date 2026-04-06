@@ -1,0 +1,126 @@
+openapi: 3.0.3
+info:
+  title: Mock API for API Key Injection Testing
+  version: "1.0.0"
+  description: |
+    A mock API that echoes back request headers and body.
+    Used to verify that the API Key Interceptor correctly injects
+    per-user API keys into requests.
+
+servers:
+  - url: ${MockApiUrl}
+
+security:
+  - apiKey: []
+
+paths:
+  /echo:
+    post:
+      operationId: echo
+      summary: Echo request headers and body
+      description: Returns the received headers and body, useful for verifying API key injection.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                message:
+                  type: string
+                  description: Optional message to echo back
+      responses:
+        "200":
+          description: Echoed request details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EchoResponse"
+
+  /dashboards:
+    get:
+      operationId: listDashboards
+      summary: List dashboards (mock)
+      description: Returns a mock list of dashboards. Requires valid API key.
+      responses:
+        "200":
+          description: List of dashboards
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dashboards:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                        name:
+                          type: string
+                        slug:
+                          type: string
+
+  /queries:
+    get:
+      operationId: listQueries
+      summary: List saved queries (mock)
+      description: Returns a mock list of saved queries. Requires valid API key.
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 25
+      responses:
+        "200":
+          description: List of queries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                        name:
+                          type: string
+                        query:
+                          type: string
+
+components:
+  schemas:
+    EchoResponse:
+      type: object
+      properties:
+        service:
+          type: string
+        path:
+          type: string
+        method:
+          type: string
+        receivedHeaders:
+          type: object
+          description: Filtered headers (API key related)
+        allHeaderKeys:
+          type: array
+          items:
+            type: string
+        body:
+          type: object
+
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      name: X-API-Key
+      in: header

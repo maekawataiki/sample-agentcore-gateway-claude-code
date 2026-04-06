@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "remote-gw": {
+      "type": "http",
+      "url": "https://XXXXXX.execute-api.us-east-1.amazonaws.com/mcp",
+      "oauth": {
+        "clientId": "XXXXXX",
+        "callbackPort": 9090
+      }
+    }
+  }
+}
