@@ -1,4 +1,4 @@
-# Remote MCP Gateway CDK
+# AgentCore Gateway Remote MCP Hub for Claude Code
 
 Amazon Bedrock AgentCore Gateway for Claude Code MCP integration.
 Single gateway with multiple targets (GitHub, Notion, Redash) — one Cognito login covers all tools.
@@ -13,7 +13,7 @@ When AI agents call external APIs directly, credentials scatter, access control 
 
 - **Credential isolation** — The agent never holds OAuth tokens or API keys. Tokens stay in Token Vault; API keys stay in DynamoDB + Interceptor Lambda. A compromised agent cannot reach external credentials.
 - **Unified audit trail** — Every call to GitHub, Notion, Redash flows through one gateway. Who called what, when, and with which parameters is logged in one place (CloudTrail / CloudWatch Logs).
-- **Single login** — One Cognito authentication covers all SaaS targets. No per-service login.
+- **Single login** — One Cognito authentication covers all SaaS targets. 3LO targets (GitHub / Notion) require one-time per-service OAuth consent on first use, after which AgentCore manages token refresh automatically.
 - **Zero agent-side config changes** — Adding a new SaaS target means adding a gateway target, not touching `.mcp.json`.
 
 ## Architecture
@@ -22,11 +22,13 @@ When AI agents call external APIs directly, credentials scatter, access control 
 
 ### Why the OAuth Proxy (API Gateway) is needed
 
-Claude Code's MCP client expects standard OAuth endpoints (`/.well-known/oauth-protected-resource`, `/authorize`, `/token`) at the MCP server URL. AgentCore Gateway validates incoming JWTs but does not act as an OAuth Authorization Server itself.
+MCP clients (Claude Code, VS Code Copilot, etc.) expect standard OAuth endpoints at the MCP server URL — specifically RFC 9728 Protected Resource Metadata (`/.well-known/oauth-protected-resource`), `/authorize`, and `/token` — to authenticate via the OAuth authorization code flow.
+
+AgentCore Gateway validates incoming JWTs via CUSTOM_JWT auth (Cognito JWKS) but does not act as an OAuth Authorization Server itself — it does not serve these endpoints.
 
 The OAuth Proxy (Lambda behind API Gateway HTTP API) bridges this gap:
 
-1. **OAuth facade** — Serves RFC 9728 metadata and proxies `/authorize` + `/token` to Cognito, so Claude Code sees a spec-compliant OAuth server at the MCP URL
+1. **OAuth Authorization Server facade** — Serves its own RFC 9728 metadata (the `resource` identifier must match the URL the client connects to — the proxy URL, not the underlying Gateway URL) and proxies `/authorize` + `/token` to Cognito
 2. **MCP forwarding** — Forwards MCP requests to AgentCore Gateway with the Cognito JWT attached
 3. **3LO callback handling** — Receives the OAuth callback after user consent (GitHub / Notion), calls `CompleteResourceTokenAuth` to bind the token to the user's identity
 
@@ -47,6 +49,10 @@ Claude Code ──► API Gateway (HTTP API)
 | **Inbound Auth** (Cognito) | Claude Code → OAuth Proxy → Cognito → JWT | On MCP server connection |
 | **Outbound 3LO** (GitHub / Notion) | AgentCore Gateway → SaaS OAuth → User consent → Token Vault | On first tool call to a 3LO target |
 | **API Key Swap** (Redash) | AgentCore Gateway → REQUEST Interceptor → DynamoDB lookup → inject header | On every Redash tool call |
+
+### Operation Flow
+
+![Operation Flow](docs/flow.png)
 
 ### Stacks
 
