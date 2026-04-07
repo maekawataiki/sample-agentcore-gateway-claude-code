@@ -29,6 +29,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 import boto3
 
@@ -41,13 +42,70 @@ SESSION_TABLE_NAME = os.environ.get("SESSION_TABLE_NAME", "")
 _ALLOWED_REDIRECT_HOSTS = {"127.0.0.1", "localhost"}
 
 
+# ─── Structured audit logging ──────────────────────────────────────────────
+
+
+def _extract_sub_from_jwt(auth_header):
+    """Extract 'sub' claim from JWT without verification (for logging only)."""
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None
+    try:
+        token = auth_header.split(" ", 1)[1]
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload = parts[1] + "=" * (4 - len(parts[1]) % 4)
+        claims = json.loads(base64.b64decode(payload))
+        return claims.get("sub") or claims.get("username")
+    except Exception:
+        return None
+
+
+def audit_log(*, action, correlation_id, caller=None, path=None, status=None, detail=None):
+    """Emit a structured JSON audit log entry."""
+    entry = {
+        "audit": True,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "correlationId": correlation_id,
+        "action": action,
+    }
+    if caller:
+        entry["caller"] = caller
+    if path:
+        entry["path"] = path
+    if status is not None:
+        entry["status"] = status
+    if detail:
+        entry["detail"] = detail
+    print(json.dumps(entry, separators=(",", ":")))
+
+
 def lambda_handler(event, context):
     path = event.get("path", "") or event.get("rawPath", "/")
     method = (
         event.get("httpMethod")
         or event.get("requestContext", {}).get("http", {}).get("method", "GET")
     )
-    print(f"[REQ] {method} {path}")
+    # Correlation ID: use API Gateway request ID if available, else generate one
+    correlation_id = (
+        event.get("requestContext", {}).get("requestId")
+        or str(uuid.uuid4())
+    )
+    # Extract caller identity for audit
+    auth_header = get_header(event, "Authorization")
+    caller = _extract_sub_from_jwt(auth_header)
+    source_ip = (
+        event.get("requestContext", {}).get("http", {}).get("sourceIp")
+        or event.get("requestContext", {}).get("identity", {}).get("sourceIp")
+    )
+
+    audit_log(
+        action="request",
+        correlation_id=correlation_id,
+        caller=caller,
+        path=f"{method} {path}",
+        detail=f"sourceIp={source_ip}" if source_ip else None,
+    )
 
     if method == "OPTIONS":
         return cors_ok()
@@ -252,12 +310,14 @@ def handle_3lo_callback(event):
 
     Reference: https://github.com/awslabs/agentcore-samples/issues/801
     """
+    correlation_id = event.get("requestContext", {}).get("requestId", "")
     params = (event.get("queryStringParameters") or {})
     session_id = params.get("session_id")
     user_id = params.get("user_id")
     user_token = params.get("user_token")
 
     if not session_id:
+        audit_log(action="3lo_callback", correlation_id=correlation_id, status=400, detail="missing session_id")
         return html_response(400, "Missing session_id",
                              "The callback URL must include a session_id parameter.")
 
@@ -280,9 +340,11 @@ def handle_3lo_callback(event):
         "userIdentifier": user_identifier,
     })
 
-    print(f"[3LO-CALLBACK] sessionUri={session_id}")
-    print(f"[3LO-CALLBACK] userIdentifier keys={list(user_identifier.keys())}")
-    print(f"[3LO-CALLBACK] POST {api_url}")
+    audit_log(
+        action="3lo_callback",
+        correlation_id=correlation_id,
+        detail=f"sessionUri={session_id[:40]}... identifierType={list(user_identifier.keys())[0]}",
+    )
 
     try:
         from botocore.auth import SigV4Auth
@@ -302,16 +364,18 @@ def handle_3lo_callback(event):
 
         with urllib.request.urlopen(req, timeout=30) as resp:
             resp_body = resp.read().decode()
-            print(f"[3LO-CALLBACK] CompleteResourceTokenAuth OK: {resp_body[:500]}")
+            audit_log(action="3lo_callback", correlation_id=correlation_id, status=200, detail="CompleteResourceTokenAuth OK")
             return html_response(200, "Authorization Complete!",
                                  "You can close this window and return to your agent session.")
     except urllib.error.HTTPError as e:
         error_body = e.read().decode()
         print(f"[3LO-CALLBACK] CompleteResourceTokenAuth error {e.code}: {error_body}")
+        audit_log(action="3lo_callback", correlation_id=correlation_id, status=e.code, detail="CompleteResourceTokenAuth failed")
         return html_response(e.code, "Token exchange failed",
                              "Authorization could not be completed. Check server logs for details.")
     except Exception as exc:
         print(f"[3LO-CALLBACK] Error: {exc}")
+        audit_log(action="3lo_callback", correlation_id=correlation_id, status=500, detail=f"exception={type(exc).__name__}")
         return html_response(500, "Token exchange failed",
                              "An unexpected error occurred. Check server logs for details.")
 
@@ -346,6 +410,22 @@ def proxy_to_gateway(event):
     if event.get("isBase64Encoded") and body:
         body = base64.b64decode(body)
 
+    # Extract audit context
+    correlation_id = event.get("requestContext", {}).get("requestId", "")
+    auth = get_header(event, "Authorization")
+    caller = _extract_sub_from_jwt(auth)
+
+    # Extract MCP method/tool for audit (e.g. "tools/call" with tool name)
+    mcp_method = ""
+    mcp_tool = ""
+    if isinstance(body, (str, bytes)):
+        try:
+            parsed = json.loads(body)
+            mcp_method = parsed.get("method", "")
+            mcp_tool = parsed.get("params", {}).get("name", "")
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
     # Forward to gateway /mcp endpoint regardless of incoming path
     target_url = GATEWAY_URL
 
@@ -369,14 +449,20 @@ def proxy_to_gateway(event):
     for k, v in req_headers.items():
         req.add_header(k, v)
 
-    auth = get_header(event, "Authorization")
     if auth:
         req.add_header("Authorization", auth)
 
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             resp_body = resp.read().decode()
-            print(f"[PROXY] Gateway {resp.status}: {resp_body[:500]}")
+
+            audit_log(
+                action="mcp_proxy",
+                correlation_id=correlation_id,
+                caller=caller,
+                status=resp.status,
+                detail=f"mcp_method={mcp_method} tool={mcp_tool}" if mcp_method else None,
+            )
 
             # Cache user token when elicitation response detected
             _cache_elicitation_token(resp_body, auth)
@@ -394,13 +480,26 @@ def proxy_to_gateway(event):
             }
     except urllib.error.HTTPError as e:
         error_body = e.read().decode()
-        print(f"[PROXY] Gateway error {e.code}: {error_body[:500]}")
+        audit_log(
+            action="mcp_proxy",
+            correlation_id=correlation_id,
+            caller=caller,
+            status=e.code,
+            detail=f"mcp_method={mcp_method} tool={mcp_tool} error=true",
+        )
         resp_headers = {"Content-Type": "application/json"}
         session_id = e.headers.get("Mcp-Session-Id")
         if session_id:
             resp_headers["Mcp-Session-Id"] = session_id
         return {"statusCode": e.code, "headers": resp_headers, "body": error_body}
     except Exception as e:
+        audit_log(
+            action="mcp_proxy",
+            correlation_id=correlation_id,
+            caller=caller,
+            status=502,
+            detail=f"mcp_method={mcp_method} exception={type(e).__name__}",
+        )
         return json_response(502, {"error": {"code": -32603, "message": str(e)}})
 
 

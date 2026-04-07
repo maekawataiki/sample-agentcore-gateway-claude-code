@@ -1,5 +1,6 @@
 import * as cdk from "aws-cdk-lib";
 import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as logs from "aws-cdk-lib/aws-logs";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import { Construct } from "constructs";
 import * as path from "path";
@@ -33,6 +34,8 @@ export class ApiKeyInterceptorLambdaConstruct extends Construct {
       architecture: lambda.Architecture.ARM_64,
       timeout: cdk.Duration.seconds(30),
       description: "API Key Request Interceptor - DynamoDB lookup + header injection",
+      tracing: lambda.Tracing.ACTIVE,
+      logRetention: logs.RetentionDays.THREE_MONTHS,
       environment: {
         APIKEY_TABLE_NAME: props.apiKeyTable.tableName,
         REGION: cdk.Stack.of(this).region,

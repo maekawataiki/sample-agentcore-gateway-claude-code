@@ -108,6 +108,8 @@ export class GatewayStack extends cdk.Stack {
       architecture: lambda.Architecture.ARM_64,
       timeout: cdk.Duration.seconds(10),
       description: 'Response interceptor — passthrough for -32042 elicitation',
+      tracing: lambda.Tracing.ACTIVE,
+      logRetention: logs.RetentionDays.THREE_MONTHS,
     })
     responseInterceptor.grantInvoke(
       new iam.ServicePrincipal('bedrock-agentcore.amazonaws.com'),
@@ -138,6 +140,10 @@ export class GatewayStack extends cdk.Stack {
                 'bedrock-agentcore:GetOauth2CredentialProvider',
                 'bedrock-agentcore:GetApiKeyCredentialProvider',
                 'bedrock-agentcore:CompleteResourceTokenAuth',
+                'bedrock-agentcore:GetResourceOauth2Token',
+                'bedrock-agentcore:GetResourceApiKey',
+                'bedrock-agentcore:GetWorkloadAccessToken',
+                'bedrock-agentcore:GetWorkloadAccessTokenForJWT',
               ],
               resources: [`arn:aws:bedrock-agentcore:${this.region}:${this.account}:*`],
             }),
@@ -207,7 +213,16 @@ export class GatewayStack extends cdk.Stack {
         action: 'CreateApiKeyCredentialProvider',
         parameters: {
           name: apiKeyProviderName,
-          apiKey: 'placeholder-key-overridden-by-interceptor',
+          apiKey: 'Key placeholder-overridden-by-interceptor',
+        },
+        physicalResourceId: cr.PhysicalResourceId.fromResponse('credentialProviderArn'),
+      },
+      onUpdate: {
+        service: 'bedrock-agentcore-control',
+        action: 'UpdateApiKeyCredentialProvider',
+        parameters: {
+          name: apiKeyProviderName,
+          apiKey: 'Key placeholder-overridden-by-interceptor',
         },
         physicalResourceId: cr.PhysicalResourceId.fromResponse('credentialProviderArn'),
       },
@@ -220,6 +235,7 @@ export class GatewayStack extends cdk.Stack {
         new iam.PolicyStatement({
           actions: [
             'bedrock-agentcore:CreateApiKeyCredentialProvider',
+            'bedrock-agentcore:UpdateApiKeyCredentialProvider',
             'bedrock-agentcore:DeleteApiKeyCredentialProvider',
             'bedrock-agentcore:GetApiKeyCredentialProvider',
           ],
@@ -230,7 +246,7 @@ export class GatewayStack extends cdk.Stack {
           resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`],
         }),
       ]),
-      logRetention: logs.RetentionDays.ONE_WEEK,
+      logRetention: logs.RetentionDays.THREE_MONTHS,
     })
 
     const redashSpec = fs.readFileSync(
@@ -248,7 +264,7 @@ export class GatewayStack extends cdk.Stack {
         credentialProvider: {
           apiKeyCredentialProvider: {
             providerArn: apiKeyProvider.getResponseField('credentialProviderArn'),
-            credentialParameterName: 'X-API-Key',
+            credentialParameterName: 'Authorization',
             credentialLocation: 'HEADER',
           },
         },
@@ -348,13 +364,14 @@ export class GatewayStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(60),
       memorySize: 256,
       description: 'Unified OAuth proxy — Cognito facade + MCP forwarding + 3LO callback',
+      tracing: lambda.Tracing.ACTIVE,
       environment: {
         GATEWAY_URL: gateway.attrGatewayUrl,
         COGNITO_DOMAIN: props.cognitoDomain,
         COGNITO_CLIENT_ID: props.cognitoClientId,
         SESSION_TABLE_NAME: sessionTable.tableName,
       },
-      logRetention: logs.RetentionDays.ONE_WEEK,
+      logRetention: logs.RetentionDays.THREE_MONTHS,
     })
     proxyLambda.addToRolePolicy(new iam.PolicyStatement({
       actions: ['bedrock-agentcore:CompleteResourceTokenAuth'],
@@ -371,6 +388,32 @@ export class GatewayStack extends cdk.Stack {
     const integration = new apigwv2integrations.HttpLambdaIntegration('Int', proxyLambda)
     httpApi.addRoutes({ path: '/{proxy+}', methods: [apigwv2.HttpMethod.ANY], integration })
     httpApi.addRoutes({ path: '/', methods: [apigwv2.HttpMethod.ANY], integration })
+
+    // ── HTTP API Access Logging ──
+    const accessLogGroup = new logs.LogGroup(this, 'ProxyApiAccessLog', {
+      logGroupName: `/aws/apigateway/unified-mcp-proxy-${this.stackName}`,
+      retention: logs.RetentionDays.THREE_MONTHS,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    })
+    const defaultStage = httpApi.defaultStage?.node.defaultChild as apigwv2.CfnStage
+    defaultStage.accessLogSettings = {
+      destinationArn: accessLogGroup.logGroupArn,
+      format: JSON.stringify({
+        requestId: '$context.requestId',
+        ip: '$context.identity.sourceIp',
+        caller: '$context.identity.caller',
+        user: '$context.identity.user',
+        requestTime: '$context.requestTime',
+        httpMethod: '$context.httpMethod',
+        path: '$context.path',
+        status: '$context.status',
+        protocol: '$context.protocol',
+        responseLength: '$context.responseLength',
+        latency: '$context.responseLatency',
+        integrationLatency: '$context.integrationLatency',
+        error: '$context.error.message',
+      }),
+    }
 
     // ── Register proxy callback URL with Cognito ──
     new CognitoCallbackRegistration(this, 'CallbackReg', {

@@ -152,7 +152,38 @@ aws cognito-idp admin-set-user-password \
   --permanent
 ```
 
-### 5. Set OAuth App callback URLs
+### 5. Register Redash API key per user (if `deployRedash: true`)
+
+The Gateway's API Key Swap interceptor looks up each user's Redash API key from DynamoDB using their Cognito `sub` (UUID) as the key.
+
+```bash
+# Get the user's Cognito sub
+USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name CognitoStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`UserPoolId`].OutputValue' --output text)
+
+aws cognito-idp admin-get-user \
+  --user-pool-id $USER_POOL_ID \
+  --username your-email@example.com \
+  --query 'UserAttributes[?Name==`sub`].Value' --output text
+```
+
+```bash
+# Register the API key mapping
+TABLE_NAME=$(aws cloudformation describe-stacks --stack-name GatewayStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`ApiKeyTableName`].OutputValue' --output text)
+
+aws dynamodb put-item --table-name $TABLE_NAME --item '{
+  "userId": {"S": "<COGNITO_SUB_UUID>"},
+  "apiKey": {"S": "Key <REDASH_API_KEY>"},
+  "headerName": {"S": "Authorization"}
+}'
+```
+
+> The `apiKey` value must include the `Key ` prefix (e.g. `Key LF5Xxyz...`). Each Cognito user needs their own entry to use Redash tools.
+>
+> The interceptor (`apikey_request_interceptor/index.py`) can be customized to change the lookup key — for example, using Cognito groups or email instead of `sub`, or mapping a group to a shared API key for team-wide access.
+
+### 6. Set OAuth App callback URLs (3LO only)
 
 After deploy, get the credential provider callback URLs:
 
@@ -176,7 +207,7 @@ Set these URLs in your OAuth App settings:
 
 > These URLs change when the credential provider is recreated (stack delete + create).
 
-### 6. Configure `.mcp.json`
+### 7. Configure `.mcp.json`
 
 ```bash
 # Get the values
@@ -208,7 +239,7 @@ Add to your `.mcp.json`:
 
 One entry covers all tools (GitHub, Notion, Redash).
 
-### 7. Update gateway target `defaultReturnUrl` (3LO only)
+### 8. Update gateway target `defaultReturnUrl` (3LO only)
 
 The 3LO targets are created with a placeholder `defaultReturnUrl`.
 After deploy, update them to point to the proxy's `/3lo-callback` endpoint:
@@ -293,6 +324,33 @@ Runs [cdk-nag](https://github.com/cdklabs/cdk-nag) AwsSolutions checks against b
 ### Auth link not displayed in Claude Code
 - The response interceptor must pass through `-32042` responses unchanged
 - MCP protocol version must be `2025-11-25`
+
+## Observability
+
+All components emit structured logs to CloudWatch with 90-day retention.
+
+| Layer | What is logged |
+|-------|---------------|
+| **HTTP API Access Logs** | Every request: requestId, source IP, method, path, status, latency (structured JSON) |
+| **OAuth Proxy Lambda** | Structured audit entries (`"audit": true`): caller identity (JWT sub), MCP method/tool, 3LO callback status, correlation ID tied to API Gateway requestId |
+| **API Key Interceptor** | Key lookup results per request (success/failure) |
+| **Response Interceptor** | Passthrough logging for elicitation flows |
+| **X-Ray Tracing** | Active tracing on all Lambda functions — end-to-end latency breakdown across proxy → gateway → backend |
+| **AgentCore Gateway** | CloudTrail events for gateway invocations |
+
+To query audit logs:
+
+```bash
+# Find all MCP tool calls by a specific user
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/oauth-proxy-GatewayStack \
+  --filter-pattern '{ $.audit = true && $.caller = "user-sub-id" }'
+
+# Find all failed requests
+aws logs filter-log-events \
+  --log-group-name /aws/apigateway/unified-mcp-proxy-GatewayStack \
+  --filter-pattern '{ $.status >= 400 }'
+```
 
 ## License
 

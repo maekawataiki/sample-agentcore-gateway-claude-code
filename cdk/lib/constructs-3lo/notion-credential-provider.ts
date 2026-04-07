@@ -92,7 +92,7 @@ export class NotionCredentialProviderConstruct extends Construct {
             resources: [`arn:aws:secretsmanager:${stack.region}:${stack.account}:secret:*`],
           }),
         ]),
-        logRetention: logs.RetentionDays.ONE_WEEK,
+        logRetention: logs.RetentionDays.THREE_MONTHS,
       }
     );
 
