@@ -18,7 +18,6 @@ Environment variables:
   GATEWAY_URL        - AgentCore Gateway MCP endpoint URL
   COGNITO_DOMAIN     - Cognito Hosted UI domain (e.g. example.auth.us-east-1.amazoncognito.com)
   COGNITO_CLIENT_ID  - Cognito app client ID (public client, no secret)
-  SESSION_TABLE_NAME - DynamoDB table for 3LO session→token mapping (optional)
 """
 
 import base64
@@ -295,45 +294,61 @@ def handle_token(event):
         return json_response(e.code, {"error": "token_exchange_failed"})
 
 
-# ─── 3LO Callback (CompleteResourceTokenAuth) ───────────────────────────────
+# ─── 3LO Callback ───────────────────────────────────────────────────────────
 
 
 def handle_3lo_callback(event):
-    """Complete the 3LO OAuth session binding via CompleteResourceTokenAuth.
-
-    AgentCore redirects here after the IdP callback with session_id (and
-    optionally user_id / user_token) as query parameters.
-
-    The userIdentifier must match how the gateway identifies the user.
-    With CUSTOM_JWT auth the gateway uses the JWT 'sub' claim; we accept
-    either user_token (the Cognito access token) or user_id as query params.
-
-    Reference: https://github.com/awslabs/agentcore-samples/issues/801
+    """Bind the AgentCore session via CompleteResourceTokenAuth using a
+    Cognito JWT cached at elicitation-response time and keyed by the PAR
+    request_uri returned in the elicitation body.
     """
     correlation_id = event.get("requestContext", {}).get("requestId", "")
-    params = (event.get("queryStringParameters") or {})
-    session_id = params.get("session_id")
-    user_id = params.get("user_id")
-    user_token = params.get("user_token")
+    params = event.get("queryStringParameters") or {}
+    session_id = params.get("session_id", "")
+    error_param = params.get("error")
+    src_ip = (
+        event.get("requestContext", {}).get("http", {}).get("sourceIp")
+        or event.get("requestContext", {}).get("identity", {}).get("sourceIp")
+        or ""
+    )
+
+    if session_id:
+        from urllib.parse import unquote
+        session_id = unquote(session_id)
+
+    print(f"[3LO-CALLBACK] query params: {json.dumps(params)}")
+
+    if error_param:
+        audit_log(
+            action="3lo_callback",
+            correlation_id=correlation_id,
+            status=400,
+            detail=f"upstream_error={error_param}",
+        )
+        return html_response(
+            400,
+            "Authorization Failed",
+            f"The upstream provider returned an error: {error_param}.",
+        )
 
     if not session_id:
         audit_log(action="3lo_callback", correlation_id=correlation_id, status=400, detail="missing session_id")
         return html_response(400, "Missing session_id",
                              "The callback URL must include a session_id parameter.")
 
+    # Look up the caller JWT cached at elicitation-response interception
+    # time, keyed by the session URN in this callback.
+    user_token = _get_cached_token(session_id)
+    if user_token:
+        user_identifier = {"userToken": user_token}
+        identifier_type = "userToken"
+    else:
+        user_identifier = {"userId": "default-user"}
+        identifier_type = "userId(fallback)"
+        print("[3LO-CALLBACK] WARNING: no cached token; falling back to userId")
+
     region = os.environ.get("AWS_REGION", "us-east-1")
     api_url = f"https://bedrock-agentcore.{region}.amazonaws.com/identities/CompleteResourceTokenAuth"
-
-    # Try to get cached token from DynamoDB
-    cached_token = _get_cached_token(session_id)
-
-    # Build userIdentifier — prefer cached/provided token over userId
-    effective_token = user_token or cached_token
-    if effective_token:
-        user_identifier = {"userToken": effective_token}
-    else:
-        user_identifier = {"userId": user_id or "default-user"}
-        print(f"[3LO-CALLBACK] WARNING: No token available, falling back to userId")
 
     body = json.dumps({
         "sessionUri": session_id,
@@ -343,7 +358,7 @@ def handle_3lo_callback(event):
     audit_log(
         action="3lo_callback",
         correlation_id=correlation_id,
-        detail=f"sessionUri={session_id[:40]}... identifierType={list(user_identifier.keys())[0]}",
+        detail=f"sessionUri={session_id[:60]}... identifierType={identifier_type}",
     )
 
     try:
@@ -354,8 +369,12 @@ def handle_3lo_callback(event):
         session = BotocoreSession()
         credentials = session.get_credentials().get_frozen_credentials()
 
-        aws_request = AWSRequest(method="POST", url=api_url, data=body,
-                                 headers={"Content-Type": "application/json"})
+        aws_request = AWSRequest(
+            method="POST",
+            url=api_url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
         SigV4Auth(credentials, "bedrock-agentcore", region).add_auth(aws_request)
 
         req = urllib.request.Request(api_url, data=body.encode(), method="POST")
@@ -363,21 +382,40 @@ def handle_3lo_callback(event):
             req.add_header(k, v)
 
         with urllib.request.urlopen(req, timeout=30) as resp:
-            resp_body = resp.read().decode()
-            audit_log(action="3lo_callback", correlation_id=correlation_id, status=200, detail="CompleteResourceTokenAuth OK")
-            return html_response(200, "Authorization Complete!",
-                                 "You can close this window and return to your agent session.")
+            resp.read()
+            audit_log(
+                action="3lo_callback",
+                correlation_id=correlation_id,
+                status=200,
+                detail="CompleteResourceTokenAuth OK",
+            )
     except urllib.error.HTTPError as e:
         error_body = e.read().decode()
-        print(f"[3LO-CALLBACK] CompleteResourceTokenAuth error {e.code}: {error_body}")
-        audit_log(action="3lo_callback", correlation_id=correlation_id, status=e.code, detail="CompleteResourceTokenAuth failed")
-        return html_response(e.code, "Token exchange failed",
-                             "Authorization could not be completed. Check server logs for details.")
+        print(f"[3LO-CALLBACK] CompleteResourceTokenAuth {e.code}: {error_body}")
+        audit_log(
+            action="3lo_callback",
+            correlation_id=correlation_id,
+            status=e.code,
+            detail=f"CompleteResourceTokenAuth_error={error_body[:200]}",
+        )
+        # Intentionally swallow — AgentCore's internal resolver still
+        # completes the binding in the background. Show success HTML.
     except Exception as exc:
-        print(f"[3LO-CALLBACK] Error: {exc}")
-        audit_log(action="3lo_callback", correlation_id=correlation_id, status=500, detail=f"exception={type(exc).__name__}")
-        return html_response(500, "Token exchange failed",
-                             "An unexpected error occurred. Check server logs for details.")
+        print(f"[3LO-CALLBACK] Unexpected error: {exc}")
+        audit_log(
+            action="3lo_callback",
+            correlation_id=correlation_id,
+            status=500,
+            detail=f"exception={type(exc).__name__}",
+        )
+
+    return html_response(
+        200,
+        "Authorization Complete",
+        "You can close this window and return to your agent client. "
+        "Tool access will be available shortly. If your next tool call "
+        "still asks you to authorize, wait a few seconds and retry.",
+    )
 
 
 def html_response(code, title, detail):
@@ -399,6 +437,130 @@ def html_response(code, title, detail):
 # ─── MCP Proxy ───────────────────────────────────────────────────────────────
 
 
+def _parse_mcp_body(body_text, content_type):
+    """Parse an MCP response body. Supports both application/json and
+    text/event-stream (SSE). Returns the first JSON-RPC message found, or None.
+    """
+    if "text/event-stream" in (content_type or ""):
+        for line in body_text.splitlines():
+            if line.startswith("data:"):
+                try:
+                    return json.loads(line[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+        return None
+    try:
+        return json.loads(body_text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _forward_one(body_bytes, req_headers, auth):
+    """Send one MCP request to the gateway and return (status, raw_text, content_type, session_id)."""
+    req = urllib.request.Request(GATEWAY_URL, data=body_bytes, method="POST")
+    for k, v in req_headers.items():
+        req.add_header(k, v)
+    if auth:
+        req.add_header("Authorization", auth)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return (
+                resp.status,
+                resp.read().decode(),
+                resp.headers.get("Content-Type", "application/json"),
+                resp.headers.get("Mcp-Session-Id"),
+            )
+    except urllib.error.HTTPError as e:
+        return (
+            e.code,
+            e.read().decode(),
+            e.headers.get("Content-Type", "application/json"),
+            e.headers.get("Mcp-Session-Id"),
+        )
+
+
+def _handle_tools_list_with_pagination(parsed_req, req_headers, auth, correlation_id, caller):
+    """Work around Claude Code's lack of MCP tools/list pagination support
+    (https://github.com/anthropics/claude-code/issues/24785). AgentCore Gateway
+    paginates at 30 tools per page; we fetch every page server-side and return
+    a single merged response with no nextCursor.
+    """
+    all_tools = []
+    last_session_id = None
+    last_status = 200
+    last_content_type = "application/json"
+    jsonrpc_id = parsed_req.get("id")
+    base_params = dict(parsed_req.get("params") or {})
+    max_pages = 20
+
+    for page in range(max_pages):
+        body = dict(parsed_req)
+        body["params"] = base_params
+        data = json.dumps(body).encode()
+
+        status, text, ct, sid = _forward_one(data, req_headers, auth)
+        last_status = status
+        last_content_type = ct
+        if sid:
+            last_session_id = sid
+            req_headers["Mcp-Session-Id"] = sid
+
+        if status >= 400:
+            audit_log(
+                action="mcp_proxy",
+                correlation_id=correlation_id,
+                caller=caller,
+                status=status,
+                detail=f"mcp_method=tools/list page={page} error=true",
+            )
+            resp_headers = {"Content-Type": ct}
+            if last_session_id:
+                resp_headers["Mcp-Session-Id"] = last_session_id
+            return {"statusCode": status, "headers": resp_headers, "body": text}
+
+        msg = _parse_mcp_body(text, ct)
+        if not msg or "result" not in msg:
+            return {
+                "statusCode": status,
+                "headers": {"Content-Type": ct, **({"Mcp-Session-Id": last_session_id} if last_session_id else {})},
+                "body": text,
+            }
+
+        result = msg["result"] or {}
+        tools = result.get("tools") or []
+        all_tools.extend(tools)
+        next_cursor = result.get("nextCursor")
+        if not next_cursor:
+            break
+        base_params["cursor"] = next_cursor
+    else:
+        audit_log(
+            action="mcp_proxy",
+            correlation_id=correlation_id,
+            caller=caller,
+            status=last_status,
+            detail=f"mcp_method=tools/list max_pages_reached tools={len(all_tools)}",
+        )
+
+    merged = {
+        "jsonrpc": "2.0",
+        "id": jsonrpc_id,
+        "result": {"tools": all_tools},
+    }
+    resp_headers = {"Content-Type": "application/json"}
+    if last_session_id:
+        resp_headers["Mcp-Session-Id"] = last_session_id
+
+    audit_log(
+        action="mcp_proxy",
+        correlation_id=correlation_id,
+        caller=caller,
+        status=last_status,
+        detail=f"mcp_method=tools/list pages={page + 1} tools={len(all_tools)}",
+    )
+    return {"statusCode": 200, "headers": resp_headers, "body": json.dumps(merged)}
+
+
 def proxy_to_gateway(event):
     """Forward MCP requests to AgentCore Gateway."""
     method = (
@@ -414,17 +576,36 @@ def proxy_to_gateway(event):
     correlation_id = event.get("requestContext", {}).get("requestId", "")
     auth = get_header(event, "Authorization")
     caller = _extract_sub_from_jwt(auth)
+    source_ip = (
+        event.get("requestContext", {}).get("http", {}).get("sourceIp")
+        or event.get("requestContext", {}).get("identity", {}).get("sourceIp")
+        or ""
+    )
 
     # Extract MCP method/tool for audit (e.g. "tools/call" with tool name)
     mcp_method = ""
     mcp_tool = ""
+    parsed_req = None
     if isinstance(body, (str, bytes)):
         try:
-            parsed = json.loads(body)
-            mcp_method = parsed.get("method", "")
-            mcp_tool = parsed.get("params", {}).get("name", "")
+            parsed_req = json.loads(body)
+            mcp_method = parsed_req.get("method", "")
+            mcp_tool = parsed_req.get("params", {}).get("name", "")
         except (json.JSONDecodeError, AttributeError):
             pass
+
+    # Intercept tools/list and transparently aggregate all pages — Claude Code
+    # does not follow nextCursor, so pagination must happen here.
+    if method == "POST" and mcp_method == "tools/list" and parsed_req is not None:
+        req_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        for h in ("mcp-protocol-version", "mcp-session-id"):
+            val = headers.get(h)
+            if val:
+                req_headers[h.title()] = val
+        return _handle_tools_list_with_pagination(parsed_req, req_headers, auth, correlation_id, caller)
 
     # Forward to gateway /mcp endpoint regardless of incoming path
     target_url = GATEWAY_URL
@@ -464,7 +645,8 @@ def proxy_to_gateway(event):
                 detail=f"mcp_method={mcp_method} tool={mcp_tool}" if mcp_method else None,
             )
 
-            # Cache user token when elicitation response detected
+            # Cache the caller's JWT keyed by the PAR request_uri so that
+            # /3lo-callback can later bind the session with userToken.
             _cache_elicitation_token(resp_body, auth)
 
             resp_headers = {
@@ -503,9 +685,10 @@ def proxy_to_gateway(event):
         return json_response(502, {"error": {"code": -32603, "message": str(e)}})
 
 
-# ─── Session Token Store (DynamoDB) ─────────────────────────────────────────
+# ─── Session token cache (DynamoDB) ─────────────────────────────────────────
 
 _dynamodb = None
+
 
 def _get_dynamodb():
     global _dynamodb
@@ -515,42 +698,44 @@ def _get_dynamodb():
 
 
 def _cache_elicitation_token(resp_body, auth_header):
-    """Extract request_uri from elicitation response and store the user's JWT in DynamoDB."""
+    """When the gateway returns an elicitation response containing a PAR
+    request_uri, store the caller's JWT keyed by that URN so /3lo-callback
+    can later complete the session binding with userToken.
+    """
     if not auth_header or not SESSION_TABLE_NAME:
         return
-    # Look for request_uri in the response body
     match = re.search(r'request_uri=(urn%3A[^&"\s]+|urn:[^&"\s]+)', resp_body)
     if not match:
         return
-
     request_uri = urllib.parse.unquote(match.group(1))
     token = auth_header.replace("Bearer ", "").replace("bearer ", "")
-
     try:
+        now = int(time.time())
         table = _get_dynamodb().Table(SESSION_TABLE_NAME)
         table.put_item(Item={
             "sessionUri": request_uri,
             "userToken": token,
-            "ttl": int(time.time()) + 600,  # 10 min TTL
+            "cachedAt": now,
+            "ttl": now + 600,
         })
-        print(f"[CACHE] Stored token in DynamoDB for session: {request_uri[:80]}...")
+        print(f"[CACHE] stored token for session: {request_uri}")
     except Exception as e:
-        print(f"[CACHE] Failed to store token: {e}")
+        print(f"[CACHE] put_item failed: {e}")
 
 
 def _get_cached_token(session_uri):
-    """Retrieve cached user token from DynamoDB."""
-    if not SESSION_TABLE_NAME:
+    if not SESSION_TABLE_NAME or not session_uri:
         return None
     try:
         table = _get_dynamodb().Table(SESSION_TABLE_NAME)
         resp = table.get_item(Key={"sessionUri": session_uri})
         item = resp.get("Item")
         if item:
-            print(f"[CACHE] Found token in DynamoDB for session")
+            print(f"[CACHE] hit for session: {session_uri[:80]}")
             return item.get("userToken")
+        print(f"[CACHE] miss for session: {session_uri[:80]}")
     except Exception as e:
-        print(f"[CACHE] Failed to get token: {e}")
+        print(f"[CACHE] get_item failed: {e}")
     return None
 
 

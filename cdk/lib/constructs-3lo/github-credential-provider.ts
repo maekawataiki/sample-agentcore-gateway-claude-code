@@ -91,6 +91,9 @@ export class GitHubCredentialProviderConstruct extends Construct {
               "bedrock-agentcore:UpdateOauth2CredentialProvider",
               "bedrock-agentcore:DeleteOauth2CredentialProvider",
               "bedrock-agentcore:GetOauth2CredentialProvider",
+              // First-time provider creation implicitly creates the default token vault
+              "bedrock-agentcore:CreateTokenVault",
+              "bedrock-agentcore:GetTokenVault",
             ],
             resources: [`arn:aws:bedrock-agentcore:${stack.region}:${stack.account}:*`],
           }),
