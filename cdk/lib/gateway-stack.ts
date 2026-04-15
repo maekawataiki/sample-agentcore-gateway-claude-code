@@ -24,7 +24,8 @@ import * as fs from 'fs'
 import * as path from 'path'
 import { Construct } from 'constructs'
 import { GitHubCredentialProviderConstruct, NotionCredentialProviderConstruct } from './constructs-3lo'
-import { ApiKeyMappingTableConstruct, ApiKeyInterceptorLambdaConstruct, RedashInstanceConstruct } from './constructs-apikey'
+import { ApiKeyInterceptorLambdaConstruct, RedashInstanceConstruct } from './constructs-apikey'
+import { AdminTablesConstruct, CognitoAdminGroupConstruct, AdminApiConstruct, AdminFrontendConstruct } from './constructs-admin'
 import { CognitoCallbackRegistration } from './constructs/cognito-callback-registration'
 
 export interface GatewayStackProps extends cdk.StackProps {
@@ -42,7 +43,6 @@ export interface GatewayStackProps extends cdk.StackProps {
   // ── Redash / API Key Swap ──
   readonly deployRedash?: boolean
   readonly redashUrl?: string
-  readonly redashAdminUserId?: string
 }
 
 export class GatewayStack extends cdk.Stack {
@@ -57,16 +57,20 @@ export class GatewayStack extends cdk.Stack {
     // API Key Swap — DynamoDB + Interceptor + Backend
     // ══════════════════════════════════════════════════════════════════════
 
-    const apiKeyTable = new ApiKeyMappingTableConstruct(this, 'ApiKeyTable')
+    // ── Admin Control Panel — Table + Cognito Group ──
+    const adminTables = new AdminTablesConstruct(this, 'AdminTables')
+    const adminGroup = new CognitoAdminGroupConstruct(this, 'AdminGroup', {
+      userPoolId: props.cognitoUserPoolId,
+    })
+
     const apiKeyInterceptor = new ApiKeyInterceptorLambdaConstruct(
-      this, 'ApiKeyInterceptor', { apiKeyTable: apiKeyTable.table },
+      this, 'ApiKeyInterceptor', { adminTable: adminTables.table },
     )
 
     let redashBackendUrl: string
     if (props.deployRedash) {
       const redash = new RedashInstanceConstruct(this, 'Redash', {
-        apiKeyTable: apiKeyTable.table,
-        adminUserId: props.redashAdminUserId || 'admin',
+        adminTable: adminTables.table,
       })
       redashBackendUrl = redash.redashUrl
       new cdk.CfnOutput(this, 'RedashUrl', { value: redash.redashUrl })
@@ -238,6 +242,9 @@ export class GatewayStack extends cdk.Stack {
             'bedrock-agentcore:UpdateApiKeyCredentialProvider',
             'bedrock-agentcore:DeleteApiKeyCredentialProvider',
             'bedrock-agentcore:GetApiKeyCredentialProvider',
+            // First-time provider creation implicitly creates the default token vault
+            'bedrock-agentcore:CreateTokenVault',
+            'bedrock-agentcore:GetTokenVault',
           ],
           resources: [`arn:aws:bedrock-agentcore:${this.region}:${this.account}:*`],
         }),
@@ -271,7 +278,10 @@ export class GatewayStack extends cdk.Stack {
       }],
     })
 
-    // ── GitHub Target ──
+    // ── GitHub Credential Provider ──
+    // Target creation is handled by bin/sync-mcp-targets.sh (outside CDK)
+    // because MCP server targets with Authorization Code grant require
+    // interactive OAuth consent during creation — not possible via CFN.
     let githubProvider: GitHubCredentialProviderConstruct | undefined
     if (hasGithub) {
       githubProvider = new GitHubCredentialProviderConstruct(
@@ -281,60 +291,21 @@ export class GatewayStack extends cdk.Stack {
           clientSecret: props.githubClientSecret!,
         },
       )
-      const githubSpec = fs.readFileSync(
-        path.join(__dirname, '../openapi/github-api.yaml'), 'utf-8',
-      )
-      new bedrockagentcore.CfnGatewayTarget(this, 'GitHubTarget', {
-        name: `github-target-${this.stackName}`,
-        gatewayIdentifier: gateway.attrGatewayIdentifier,
-        targetConfiguration: {
-          mcp: { openApiSchema: { inlinePayload: githubSpec } },
-        },
-        credentialProviderConfigurations: [{
-          credentialProviderType: 'OAUTH',
-          credentialProvider: {
-            oauthCredentialProvider: {
-              providerArn: githubProvider.credentialProviderArn,
-              grantType: 'AUTHORIZATION_CODE',
-              defaultReturnUrl: 'https://placeholder.example.com/3lo-callback',
-              scopes: ['repo', 'read:org', 'read:user', 'user:email'],
-            },
-          },
-        }],
-      })
     }
 
-    // ── Notion Target ──
+    // ── Notion Credential Provider ──
     let notionProvider: NotionCredentialProviderConstruct | undefined
     if (hasNotion) {
+      // Logical ID intentionally 'NotionCustomProvider' (not 'NotionProvider')
+      // to force CFN to replace the resource when migrating from the built-in
+      // NotionOauth2 vendor to CustomOauth2. Vendor type cannot be updated in-place.
       notionProvider = new NotionCredentialProviderConstruct(
-        this, 'NotionProvider', {
+        this, 'NotionCustomProvider', {
           uniqueId: 'notion',
           clientId: props.notionClientId!,
           clientSecret: props.notionClientSecret!,
         },
       )
-      const notionSpec = fs.readFileSync(
-        path.join(__dirname, '../openapi/notion-api.yaml'), 'utf-8',
-      )
-      new bedrockagentcore.CfnGatewayTarget(this, 'NotionTarget', {
-        name: `notion-target-${this.stackName}`,
-        gatewayIdentifier: gateway.attrGatewayIdentifier,
-        targetConfiguration: {
-          mcp: { openApiSchema: { inlinePayload: notionSpec } },
-        },
-        credentialProviderConfigurations: [{
-          credentialProviderType: 'OAUTH',
-          credentialProvider: {
-            oauthCredentialProvider: {
-              providerArn: notionProvider.credentialProviderArn,
-              grantType: 'AUTHORIZATION_CODE',
-              defaultReturnUrl: 'https://placeholder.example.com/3lo-callback',
-              scopes: [],
-            },
-          },
-        }],
-      })
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -376,6 +347,11 @@ export class GatewayStack extends cdk.Stack {
     proxyLambda.addToRolePolicy(new iam.PolicyStatement({
       actions: ['bedrock-agentcore:CompleteResourceTokenAuth'],
       resources: [`arn:aws:bedrock-agentcore:${this.region}:${this.account}:*`],
+    }))
+    // CompleteResourceTokenAuth internally reads the OAuth client secret from Secrets Manager
+    proxyLambda.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`],
     }))
     sessionTable.grantReadWriteData(proxyLambda)
 
@@ -423,6 +399,33 @@ export class GatewayStack extends cdk.Stack {
     })
 
     // ══════════════════════════════════════════════════════════════════════
+    // Admin Control Panel API
+    // ══════════════════════════════════════════════════════════════════════
+
+    const adminApi = new AdminApiConstruct(this, 'AdminApi', {
+      cognitoUserPoolId: props.cognitoUserPoolId,
+      adminGroupName: adminGroup.groupName,
+      adminTable: adminTables.table,
+    })
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Admin Frontend (S3 + CloudFront)
+    // ══════════════════════════════════════════════════════════════════════
+
+    const adminFrontend = new AdminFrontendConstruct(this, 'AdminFrontend', {
+      cognitoDomain: `https://${props.cognitoDomain}`,
+      cognitoClientId: props.cognitoClientId,
+      adminApiUrl: `${adminApi.apiUrl}admin/v1`,
+    })
+
+    // Register CloudFront URL as Cognito callback + logout URL
+    new CognitoCallbackRegistration(this, 'AdminCallbackReg', {
+      userPoolId: props.cognitoUserPoolId,
+      clientId: props.cognitoClientId,
+      callbackUrl: adminFrontend.distributionUrl,
+    })
+
+    // ══════════════════════════════════════════════════════════════════════
     // Outputs
     // ══════════════════════════════════════════════════════════════════════
 
@@ -436,11 +439,19 @@ export class GatewayStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'GatewayUrl', {
       value: gateway.attrGatewayUrl,
     })
-    new cdk.CfnOutput(this, 'ApiKeyTableName', {
-      value: apiKeyTable.table.tableName,
+    new cdk.CfnOutput(this, 'AdminTableName', {
+      value: adminTables.table.tableName,
     })
     new cdk.CfnOutput(this, 'ProxyUrl', {
       value: httpApi.apiEndpoint,
+    })
+    new cdk.CfnOutput(this, 'AdminApiUrl', {
+      value: `${adminApi.apiUrl}admin/v1`,
+      description: 'Admin API base URL (e.g. <this>/services, <this>/services/{name}/mappings)',
+    })
+    new cdk.CfnOutput(this, 'AdminPanelUrl', {
+      value: adminFrontend.distributionUrl,
+      description: 'Admin Panel URL (open in browser)',
     })
     // Credential provider callback URLs are not available in CFN outputs.
     // After deploy, retrieve them with:
@@ -448,13 +459,17 @@ export class GatewayStack extends cdk.Stack {
     if (githubProvider) {
       new cdk.CfnOutput(this, 'GitHubCredentialProviderName', {
         value: githubProvider.credentialProviderName,
-        description: 'Run: aws bedrock-agentcore-control get-oauth2-credential-provider --name <this> --query callbackUrl',
+      })
+      new cdk.CfnOutput(this, 'GitHubCredentialProviderArn', {
+        value: githubProvider.credentialProviderArn,
       })
     }
     if (notionProvider) {
       new cdk.CfnOutput(this, 'NotionCredentialProviderName', {
         value: notionProvider.credentialProviderName,
-        description: 'Run: aws bedrock-agentcore-control get-oauth2-credential-provider --name <this> --query callbackUrl',
+      })
+      new cdk.CfnOutput(this, 'NotionCredentialProviderArn', {
+        value: notionProvider.credentialProviderArn,
       })
     }
   }

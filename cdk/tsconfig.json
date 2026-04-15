@@ -17,7 +17,10 @@
     "inlineSources": true,
     "experimentalDecorators": true,
     "strictPropertyInitialization": false,
-    "typeRoots": ["./node_modules/@types"]
+    "types": ["node", "jest"],
+    "outDir": "dist",
+    "rootDir": "."
   },
-  "exclude": ["node_modules", "cdk.out"]
+  "include": ["bin/**/*.ts", "lib/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "cdk.out", "dist", "lambda"]
 }

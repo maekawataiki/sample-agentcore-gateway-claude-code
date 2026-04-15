@@ -1,16 +1,25 @@
 """API Key Request Interceptor for AgentCore Gateway.
 
-Extracts user identity from JWT Bearer token, looks up the user's API key
-in DynamoDB, and injects it as a request header for the backend service.
+Resolves an API key for the incoming MCP tool call by matching JWT claims
+against the admin table and injects it as a request header.
 
-Only injects API keys for tools matching the TARGET_PREFIX (e.g. "redash-target-").
-Other tools (GitHub, Notion 3LO) are passed through without modification so
-the Authorization header (Cognito JWT) is preserved for outbound OAuth.
+Schema (AdminTable):
+    PK = "SERVICES",      SK = <serviceName>          → service metadata
+    PK = "SVC#<service>", SK = "CLAIM#<key>#<value>"  → API key mapping
+
+Resolution:
+    1. Decode JWT (already verified by the gateway's CUSTOM_JWT authorizer).
+    2. Resolve service from tool name prefix (e.g. "redash-target-foo" → "redash").
+    3. Build candidate claim tuples from ALLOWED_CLAIM_KEYS (in priority order),
+       plus the service-default wildcard ("*", "*").
+    4. BatchGetItem for all candidates against PK="SVC#<service>".
+    5. Return the first hit in candidate order. No hit → pass through unchanged.
 
 Environment variables:
-    APIKEY_TABLE_NAME: DynamoDB table name for user -> API key mapping
-    TARGET_PREFIX:     Tool name prefix for API key injection (default: "redash-target-")
-    REGION:            AWS region (default: us-east-1)
+    ADMIN_TABLE_NAME:    DynamoDB table (required)
+    ALLOWED_CLAIM_KEYS:  Comma-separated JWT claim keys in priority order
+                         (default: "email,cognito:groups")
+    REGION:              AWS region (default: us-east-1)
 """
 
 from __future__ import annotations
@@ -22,56 +31,129 @@ from typing import Any
 
 import boto3
 
-APIKEY_TABLE_NAME = os.environ["APIKEY_TABLE_NAME"]
-TARGET_PREFIX = os.environ.get("TARGET_PREFIX", "redash-target-")
+ADMIN_TABLE_NAME = os.environ["ADMIN_TABLE_NAME"]
+ALLOWED_CLAIM_KEYS: list[str] = [
+    k.strip() for k in os.environ.get("ALLOWED_CLAIM_KEYS", "email,cognito:groups").split(",") if k.strip()
+]
 REGION = os.environ.get("REGION", "us-east-1")
 
 dynamodb = boto3.resource("dynamodb", region_name=REGION)
-apikey_table = dynamodb.Table(APIKEY_TABLE_NAME)
+admin_table = dynamodb.Table(ADMIN_TABLE_NAME)
+
+# Cache: targetPrefix → serviceName (loaded once per container)
+_service_map: dict[str, str] | None = None
 
 
-def _extract_caller_id(req: dict[str, Any]) -> str:
-    """Extract caller identity from JWT Bearer token.
+def _load_service_map() -> dict[str, str]:
+    """Query all active services once per cold start."""
+    global _service_map
+    if _service_map is not None:
+        return _service_map
 
-    Security note: This interceptor runs inside AgentCore Gateway, which has
-    already verified the JWT signature via CUSTOM_JWT auth (Cognito JWKS).
-    We decode the payload without re-verifying the signature to avoid the
-    latency of fetching JWKS on every request. The token reaching this point
-    has been authenticated by the gateway.
-    """
+    _service_map = {}
+    try:
+        resp = admin_table.query(
+            KeyConditionExpression="PK = :pk",
+            ExpressionAttributeValues={":pk": "SERVICES"},
+        )
+        for item in resp.get("Items", []):
+            if not item.get("isActive", True):
+                continue
+            prefix = item.get("targetPrefix", "")
+            name = item.get("SK", "")
+            if prefix and name:
+                _service_map[prefix] = name
+    except Exception as e:
+        print(f"[APIKEY_INTERCEPTOR] Failed to load service map: {e}")
+
+    return _service_map
+
+
+def _resolve_service(tool_name: str) -> str | None:
+    for prefix, service_name in _load_service_map().items():
+        if tool_name.startswith(prefix):
+            return service_name
+    return None
+
+
+def _decode_claims(req: dict[str, Any]) -> dict[str, Any]:
+    """Decode the JWT payload (signature already verified by the gateway)."""
     headers = req.get("headers", {})
     auth_header = headers.get("Authorization", "") or headers.get("authorization", "")
-
-    if auth_header.startswith("Bearer "):
-        try:
-            token = auth_header.split(" ", 1)[1]
-            parts = token.split(".")
-            if len(parts) != 3:
-                print("[APIKEY_INTERCEPTOR] Malformed JWT: expected 3 parts")
-                return ""
-            payload = parts[1]
-            payload += "=" * (4 - len(payload) % 4)
-            claims = json.loads(base64.b64decode(payload))
-            caller = claims.get("username", "") or claims.get("sub", "")
-            if not caller or not isinstance(caller, str) or len(caller) > 256:
-                print("[APIKEY_INTERCEPTOR] Invalid caller claim")
-                return ""
-            return caller
-        except Exception as e:
-            print(f"[APIKEY_INTERCEPTOR] JWT decode error: {e}")
-    return ""
+    if not auth_header.startswith("Bearer "):
+        return {}
+    try:
+        token = auth_header.split(" ", 1)[1]
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception as e:
+        print(f"[APIKEY_INTERCEPTOR] JWT decode error: {e}")
+        return {}
 
 
-def _get_api_key_info(user_id: str) -> dict[str, str]:
-    """Look up API key from DynamoDB."""
-    resp = apikey_table.get_item(Key={"userId": user_id})
-    item = resp.get("Item")
-    if not item:
-        raise ValueError(f"No API key mapping found for user: {user_id}")
-    return {
-        "apiKey": item["apiKey"],
-        "headerName": item.get("headerName", "X-API-Key"),
+def _claim_candidates(claims: dict[str, Any]) -> list[tuple[str, str]]:
+    """Expand JWT claims into an ordered list of (key, value) candidates.
+
+    Order reflects priority (earliest = most specific). Each allowed claim key
+    is expanded into one or more candidates (list-valued claims yield one per
+    element). A final ("*", "*") wildcard provides the service-default slot.
+    """
+    candidates: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(k: str, v: Any) -> None:
+        if v is None or v == "":
+            return
+        pair = (k, str(v))
+        if pair in seen:
+            return
+        seen.add(pair)
+        candidates.append(pair)
+
+    for key in ALLOWED_CLAIM_KEYS:
+        value = claims.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            for v in value:
+                add(key, v)
+        elif isinstance(value, str) and "," in value and key == "cognito:groups":
+            # Cognito sometimes flattens groups to a comma-separated string.
+            for v in value.split(","):
+                add(key, v.strip())
+        else:
+            add(key, value)
+
+    candidates.append(("*", "*"))
+    return candidates
+
+
+def _resolve_api_key(service: str, claims: dict[str, Any]) -> dict[str, str] | None:
+    candidates = _claim_candidates(claims)
+    pk = f"SVC#{service}"
+    keys = [{"PK": pk, "SK": f"CLAIM#{k}#{v}"} for k, v in candidates]
+
+    # BatchGetItem has a 100-key hard limit — we're nowhere near it.
+    resp = dynamodb.batch_get_item(
+        RequestItems={ADMIN_TABLE_NAME: {"Keys": keys}},
+    )
+    items_by_sk: dict[str, dict[str, Any]] = {
+        item["SK"]: item for item in resp.get("Responses", {}).get(ADMIN_TABLE_NAME, [])
     }
+
+    for k, v in candidates:
+        sk = f"CLAIM#{k}#{v}"
+        item = items_by_sk.get(sk)
+        if item:
+            print(f"[APIKEY_INTERCEPTOR] Resolved {service} via {sk}")
+            return {
+                "apiKey": item["apiKey"],
+                "headerName": item.get("headerName", "X-API-Key"),
+            }
+    return None
 
 
 def _build_error(message: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -114,39 +196,30 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     body = req.get("body", {})
     method = body.get("method", "")
 
-    caller_id = _extract_caller_id(req)
-    print(f"[APIKEY_INTERCEPTOR] Method: {method}, Caller: {caller_id}")
-
-    # Only inject API key for tools/call requests
     if method != "tools/call":
         return _build_pass_through(body)
 
-    # Only inject for tools matching the target prefix (e.g. "redash-target-")
     tool_name = body.get("params", {}).get("name", "")
-    if not tool_name.startswith(TARGET_PREFIX):
-        print(f"[APIKEY_INTERCEPTOR] Tool '{tool_name}' not a {TARGET_PREFIX} tool, passing through")
+    service = _resolve_service(tool_name)
+    if service is None:
+        print(f"[APIKEY_INTERCEPTOR] Tool '{tool_name}' not an API-key target, passing through")
         return _build_pass_through(body)
 
-    if not caller_id:
-        print("[APIKEY_INTERCEPTOR] No caller identity found")
+    claims = _decode_claims(req)
+    if not claims:
         return _build_error("Cannot identify caller", body)
 
     try:
-        key_info = _get_api_key_info(caller_id)
-        print(f"[APIKEY_INTERCEPTOR] Injecting {key_info['headerName']} for user {caller_id}")
-
-        return _build_pass_through(
-            body,
-            extra_headers={
-                key_info["headerName"]: key_info["apiKey"],
-            },
-        )
-    except ValueError:
-        # No API key mapping — pass through without injection.
-        # This happens for targets that use 3LO (GitHub, Notion) instead of
-        # API key auth. Their credential provider handles authentication.
-        print(f"[APIKEY_INTERCEPTOR] No key for {caller_id}, passing through (3LO target)")
-        return _build_pass_through(body)
+        key_info = _resolve_api_key(service, claims)
     except Exception as e:
-        print(f"[APIKEY_INTERCEPTOR] Error: {e}")
+        print(f"[APIKEY_INTERCEPTOR] Lookup error: {e}")
         return _build_error("API key lookup failed", body)
+
+    if key_info is None:
+        print(f"[APIKEY_INTERCEPTOR] No key for {service}, passing through")
+        return _build_pass_through(body)
+
+    return _build_pass_through(
+        body,
+        extra_headers={key_info["headerName"]: key_info["apiKey"]},
+    )

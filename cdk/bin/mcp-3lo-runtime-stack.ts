@@ -27,7 +27,6 @@ new GatewayStack(app, 'GatewayStack', {
   notionClientSecret: params.notionClientSecret,
   deployRedash: params.deployRedash,
   redashUrl: params.redashUrl,
-  redashAdminUserId: params.redashAdminUserId,
   env,
   description: 'Unified MCP Gateway — GitHub, Notion, Redash via single endpoint',
 })

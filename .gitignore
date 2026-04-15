@@ -71,6 +71,7 @@ pnpm-lock.yaml
 bun.lockb
 bun.lock
 !/yarn.lock
+!/pnpm-lock.yaml
 !**/test/**/yarn.lock
 !**/test/**/package-lock.json
 !**/test/**/pnpm-lock.yaml

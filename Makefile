@@ -1,48 +1,34 @@
-.PHONY: deploy destroy synth test sync-targets sync-github sync-notion delete-targets
+.PHONY: install deploy deploy-all destroy synth diff test sync-targets status dev
 
-STACK := GatewayStack
-REGION := us-east-1
+install:
+	pnpm install
 
-# ── Full deploy: CDK + MCP targets ──
+deploy:
+	pnpm deploy
 
-deploy: deploy-cdk sync-targets
+deploy-all:
+	pnpm deploy:all
+	$(MAKE) sync-targets
 
-deploy-cdk:
-	cd cdk && pnpm exec cdk deploy --all --require-approval never
-
-sync-targets: sync-github sync-notion
-
-sync-github:
-	@echo "==> Syncing GitHub MCP target..."
-	python3 bin/sync-mcp-targets.py create github || true
-
-sync-notion:
-	@echo "==> Syncing Notion MCP target..."
-	python3 bin/sync-mcp-targets.py create notion || true
-
-# ── Status ──
-
-status:
-	python3 bin/sync-mcp-targets.py list
-
-# ── Destroy: delete targets first, then CDK ──
-
-destroy: delete-targets destroy-cdk
-
-delete-targets:
+destroy:
 	python3 bin/sync-mcp-targets.py delete github || true
 	python3 bin/sync-mcp-targets.py delete notion || true
-
-destroy-cdk:
-	cd cdk && pnpm exec cdk destroy $(STACK) --force
-
-# ── Dev shortcuts ──
+	pnpm destroy
 
 synth:
-	cd cdk && pnpm exec cdk synth $(STACK) --quiet
+	pnpm synth
+
+diff:
+	pnpm diff
 
 test:
-	cd cdk && pnpm exec jest
+	pnpm test
 
-build-frontend:
-	cd frontend && pnpm run build
+sync-targets:
+	pnpm sync-targets
+
+status:
+	pnpm status
+
+dev:
+	pnpm dev:frontend

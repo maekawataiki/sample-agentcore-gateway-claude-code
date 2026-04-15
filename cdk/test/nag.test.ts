@@ -24,7 +24,6 @@ describe('cdk-nag AwsSolutions', () => {
       cognitoDomain: cognitoStack.cognitoDomain,
       cognitoUserPoolId: cognitoStack.userPoolId,
       deployRedash: false,
-      redashAdminUserId: 'test-user',
       env,
     })
 

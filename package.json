@@ -1,0 +1,24 @@
+{
+  "name": "remote-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Remote MCP Gateway — CDK stack + admin panel frontend",
+  "scripts": {
+    "build": "pnpm -r --stream build",
+    "build:frontend": "pnpm --filter admin-panel build",
+    "build:cdk": "pnpm --filter mcp-3lo-runtime-stack build",
+    "synth": "pnpm build:frontend && pnpm --filter mcp-3lo-runtime-stack exec cdk synth GatewayStack --quiet",
+    "diff": "pnpm build:frontend && pnpm --filter mcp-3lo-runtime-stack exec cdk diff GatewayStack",
+    "deploy": "pnpm build:frontend && pnpm --filter mcp-3lo-runtime-stack exec cdk deploy GatewayStack --require-approval never",
+    "deploy:all": "pnpm build:frontend && pnpm --filter mcp-3lo-runtime-stack exec cdk deploy --all --require-approval never",
+    "destroy": "pnpm --filter mcp-3lo-runtime-stack exec cdk destroy GatewayStack --force",
+    "test": "pnpm --filter mcp-3lo-runtime-stack test",
+    "dev:frontend": "pnpm --filter admin-panel dev",
+    "sync-targets": "python3 bin/sync-mcp-targets.py create github && python3 bin/sync-mcp-targets.py create notion",
+    "status": "python3 bin/sync-mcp-targets.py list"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=20"
+  }
+}

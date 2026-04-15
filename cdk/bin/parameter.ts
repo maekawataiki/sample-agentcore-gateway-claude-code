@@ -17,7 +17,6 @@ const ParameterSchema = z.object({
   // ── Redash / API Key Swap ──
   deployRedash: z.boolean().default(true),
   redashUrl: z.string().optional(),
-  redashAdminUserId: z.string().min(1),
 
   // ── GitHub 3LO (optional) ──
   githubClientId: z.string().optional(),
@@ -42,7 +41,6 @@ export const params: Parameters = ParameterSchema.parse({
   cognitoDomainPrefix: 'remote-mcp-gateway',
   deployRedash: true,
   redashUrl: undefined,
-  redashAdminUserId: 'tmae@amazon.com',
   githubClientId: process.env.GITHUB_OAUTH_CLIENT_ID || undefined,
   githubClientSecret: process.env.GITHUB_OAUTH_CLIENT_SECRET || undefined,
   notionClientId: process.env.NOTION_OAUTH_CLIENT_ID || undefined,

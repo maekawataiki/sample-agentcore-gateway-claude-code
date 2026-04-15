@@ -9,10 +9,8 @@ import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { Construct } from "constructs";
 
 export interface RedashInstanceConstructProps {
-  /** DynamoDB table to write the admin API key into */
-  readonly apiKeyTable: dynamodb.Table;
-  /** Cognito userId to map the Redash admin API key to */
-  readonly adminUserId: string;
+  /** Admin DynamoDB table to write the service + default mapping into */
+  readonly adminTable: dynamodb.Table;
 }
 
 /**
@@ -25,7 +23,9 @@ export interface RedashInstanceConstructProps {
  *   2. Starts Redash (server, worker, scheduler) + PostgreSQL + Redis
  *   3. Runs /setup to create the admin user
  *   4. Creates a "Sample DB" data source (Redash's own PostgreSQL)
- *   5. Writes the admin API key to DynamoDB (Authorization: Key <key>)
+ *   5. Writes the Redash service entry + default API-key mapping into the admin table:
+ *        PK=SERVICES,      SK=redash                 (service metadata)
+ *        PK=SVC#redash,    SK=CLAIM#*#*              (default key, all users)
  */
 export class RedashInstanceConstruct extends Construct {
   public readonly instance: ec2.Instance;
@@ -88,7 +88,7 @@ export class RedashInstanceConstruct extends Construct {
         ),
       ],
     });
-    props.apiKeyTable.grantWriteData(role);
+    props.adminTable.grantWriteData(role);
 
     // ── Secrets Manager for Redash credentials ──
     const redashSecret = new secretsmanager.Secret(this, "RedashSecret", {
@@ -203,10 +203,16 @@ done`,
   -d '{"name":"Sample DB","type":"pg","options":{"host":"postgres","port":5432,"dbname":"postgres","user":"postgres","password":"'"$PG_PASSWORD"'"}}' \\
   http://localhost:5000/api/data_sources`,
 
-      // Write API key to DynamoDB
+      // Register Redash service in the admin table
       `aws dynamodb put-item \\
-  --table-name "${props.apiKeyTable.tableName}" \\
-  --item '{"userId":{"S":"${props.adminUserId}"},"apiKey":{"S":"Key '"$API_KEY"'"},"headerName":{"S":"Authorization"},"serviceName":{"S":"redash"}}' \\
+  --table-name "${props.adminTable.tableName}" \\
+  --item '{"PK":{"S":"SERVICES"},"SK":{"S":"redash"},"displayName":{"S":"Redash"},"targetPrefix":{"S":"redash-target-"},"defaultHeaderName":{"S":"Authorization"},"defaultHeaderPrefix":{"S":"Key "},"isActive":{"BOOL":true}}' \\
+  --region "${stack.region}"`,
+
+      // Write default API-key mapping (all users, claim key=*, value=*)
+      `aws dynamodb put-item \\
+  --table-name "${props.adminTable.tableName}" \\
+  --item '{"PK":{"S":"SVC#redash"},"SK":{"S":"CLAIM#*#*"},"claimKey":{"S":"*"},"claimValue":{"S":"*"},"serviceName":{"S":"redash"},"apiKey":{"S":"Key '"$API_KEY"'"},"headerName":{"S":"Authorization"}}' \\
   --region "${stack.region}"`,
 
       // Store credentials in Secrets Manager

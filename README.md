@@ -15,6 +15,7 @@ When AI agents call external APIs directly, credentials scatter, access control 
 - **Unified audit trail** — Every call to GitHub, Notion, Redash flows through one gateway. Who called what, when, and with which parameters is logged in one place (CloudTrail / CloudWatch Logs).
 - **Single login** — One Cognito authentication covers all SaaS targets. 3LO targets (GitHub / Notion) require one-time per-service OAuth consent on first use, after which AgentCore manages token refresh automatically.
 - **Zero agent-side config changes** — Adding a new SaaS target means adding a gateway target, not touching `.mcp.json`.
+- **Self-service API key admin** — A dedicated Admin Panel (S3 + CloudFront SPA behind Cognito) lets privileged users register API keys per-service, scoped by email / Cognito group / default, without touching DynamoDB directly.
 
 ## Architecture
 
@@ -48,7 +49,7 @@ Claude Code ──► API Gateway (HTTP API)
 |------|-----------|------|
 | **Inbound Auth** (Cognito) | Claude Code → OAuth Proxy → Cognito → JWT | On MCP server connection |
 | **Outbound 3LO** (GitHub / Notion) | AgentCore Gateway → SaaS OAuth → User consent → Token Vault | On first tool call to a 3LO target |
-| **API Key Swap** (Redash) | AgentCore Gateway → REQUEST Interceptor → DynamoDB lookup → inject header | On every Redash tool call |
+| **API Key Swap** (Redash) | AgentCore Gateway → REQUEST Interceptor → Admin Table (JWT-claim match) → inject header | On every Redash tool call |
 
 ### Operation Flow
 
@@ -59,14 +60,18 @@ Claude Code ──► API Gateway (HTTP API)
 | Stack | Description |
 |-------|-------------|
 | `CognitoStack` | Shared Cognito User Pool + App Client (us-east-1) |
-| `GatewayStack` | Unified Gateway + all targets + OAuth Proxy |
+| `GatewayStack` | Unified Gateway + Redash target + OAuth Proxy + API-key Interceptor + Admin Panel (API + SPA) |
+
+> GitHub / Notion targets are **MCP server targets** (not OpenAPI) and are created outside CloudFormation by `bin/sync-mcp-targets.py` — CFN cannot handle Authorization Code-grant MCP targets because target creation requires interactive OAuth consent at create time. The Redash target remains an OpenAPI target and is created by CDK.
 
 ## Prerequisites
 
-- AWS CDK v2, Node.js 18+
+- Node.js 20+, pnpm 9+
+- AWS CDK v2
+- Python 3.11+ (for `bin/sync-mcp-targets.py`)
 - An AWS account with Bedrock AgentCore access (us-east-1)
-- GitHub OAuth App (optional)
-- Notion Integration with OAuth (optional)
+- GitHub OAuth App (optional, for 3LO)
+- Notion Integration with OAuth (optional, for 3LO)
 
 ## Configuration
 
@@ -79,7 +84,6 @@ export const params = ParameterSchema.parse({
   region: 'us-east-1',
   cognitoDomainPrefix: 'remote-mcp-gateway',
   deployRedash: true,
-  redashAdminUserId: 'you@example.com',    // ← edit this
   githubClientId: process.env.GITHUB_OAUTH_CLIENT_ID || undefined,
   githubClientSecret: process.env.GITHUB_OAUTH_CLIENT_SECRET || undefined,
   notionClientId: process.env.NOTION_OAUTH_CLIENT_ID || undefined,
@@ -103,10 +107,19 @@ export NOTION_OAUTH_CLIENT_SECRET="..."
 ### 2. Deploy
 
 ```bash
-cd cdk
-npm install
-npx cdk deploy --all --require-approval never
+pnpm install
+pnpm deploy             # builds frontend → cdk deploy GatewayStack
 ```
+
+`pnpm deploy` builds the Admin Panel frontend (`frontend/`) and deploys `GatewayStack` in one step. Use `pnpm deploy:all` to deploy every stack (`CognitoStack` + `GatewayStack`).
+
+After the stack is up, register GitHub / Notion MCP server targets (skip if not using 3LO):
+
+```bash
+pnpm sync-targets       # runs bin/sync-mcp-targets.py for github + notion
+```
+
+The sync script opens a browser for one-time OAuth consent per service (required because MCP server targets with Authorization Code grant perform `tools/list` discovery during creation). Target IDs are stored in SSM Parameter Store so reruns are idempotent.
 
 ### 3. Retrieve Redash credentials (if `deployRedash: true`)
 
@@ -152,36 +165,42 @@ aws cognito-idp admin-set-user-password \
   --permanent
 ```
 
-### 5. Register Redash API key per user (if `deployRedash: true`)
+### 5. Register API keys via the Admin Panel
 
-The Gateway's API Key Swap interceptor looks up each user's Redash API key from DynamoDB using their Cognito `sub` (UUID) as the key.
+The Gateway's API Key Swap interceptor resolves each incoming MCP call to an API key by matching JWT claims (`email`, `cognito:groups`, or the `*`/`*` wildcard) against the Admin Table in DynamoDB. Registration is done through the Admin Panel (React SPA on S3 + CloudFront).
+
+**Step 1 — Grant yourself admin access.** The Admin API requires membership in the `admin` Cognito group (auto-created by the stack).
 
 ```bash
-# Get the user's Cognito sub
 USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name CognitoStack \
   --query 'Stacks[0].Outputs[?OutputKey==`UserPoolId`].OutputValue' --output text)
 
-aws cognito-idp admin-get-user \
+aws cognito-idp admin-add-user-to-group \
   --user-pool-id $USER_POOL_ID \
   --username your-email@example.com \
-  --query 'UserAttributes[?Name==`sub`].Value' --output text
+  --group-name admin
 ```
+
+Sign out / sign in again so the new `cognito:groups` claim is reflected in your ID token.
+
+**Step 2 — Open the Admin Panel.**
 
 ```bash
-# Register the API key mapping
-TABLE_NAME=$(aws cloudformation describe-stacks --stack-name GatewayStack \
-  --query 'Stacks[0].Outputs[?OutputKey==`ApiKeyTableName`].OutputValue' --output text)
-
-aws dynamodb put-item --table-name $TABLE_NAME --item '{
-  "userId": {"S": "<COGNITO_SUB_UUID>"},
-  "apiKey": {"S": "Key <REDASH_API_KEY>"},
-  "headerName": {"S": "Authorization"}
-}'
+aws cloudformation describe-stacks --stack-name GatewayStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`AdminPanelUrl`].OutputValue' --output text
 ```
 
-> The `apiKey` value must include the `Key ` prefix (e.g. `Key LF5Xxyz...`). Each Cognito user needs their own entry to use Redash tools.
->
-> The interceptor (`apikey_request_interceptor/index.py`) can be customized to change the lookup key — for example, using Cognito groups or email instead of `sub`, or mapping a group to a shared API key for team-wide access.
+Open the URL in a browser, sign in with Cognito, then:
+
+1. **Services** page — For Redash, the `redash` service is registered automatically by the Redash instance bootstrap (+ a default `*`/`*` mapping with the Redash admin API key). Click **Register Service** to add more services; use the `redash` preset or `Custom...` for others.
+2. **API Keys** page (per service) — Register keys scoped by identity:
+   - **メールアドレス** — binds to `email=<addr>`, the highest priority
+   - **グループ** — binds to `cognito:groups=<group>`, matches if the user is in that group
+   - **デフォルト (全員)** — binds to `*`/`*`, falls back when no per-user or per-group key matches
+
+The interceptor evaluates candidates in priority order: email > group > default, and injects the first match as the configured header (e.g. `Authorization: Key <redash-api-key>`).
+
+> The Admin API is `{AdminApiUrl}/services` and `{AdminApiUrl}/services/{name}/mappings`. Direct DynamoDB edits still work but bypass the audit log (each Admin API call emits a JSON `audit` entry to the handler's CloudWatch log group).
 
 ### 6. Set OAuth App callback URLs (3LO only)
 
@@ -239,65 +258,32 @@ Add to your `.mcp.json`:
 
 One entry covers all tools (GitHub, Notion, Redash).
 
-### 8. Update gateway target `defaultReturnUrl` (3LO only)
-
-The 3LO targets are created with a placeholder `defaultReturnUrl`.
-After deploy, update them to point to the proxy's `/3lo-callback` endpoint:
-
-```bash
-GATEWAY_ID=$(aws cloudformation describe-stacks --stack-name GatewayStack \
-  --query 'Stacks[0].Outputs[?OutputKey==`GatewayId`].OutputValue' --output text)
-PROXY_URL=$(aws cloudformation describe-stacks --stack-name GatewayStack \
-  --query 'Stacks[0].Outputs[?OutputKey==`ProxyUrl`].OutputValue' --output text)
-
-# List targets
-aws bedrock-agentcore-control list-gateway-targets \
-  --gateway-identifier $GATEWAY_ID \
-  --query 'targets[].{name:name,targetId:targetId}' --output table
-
-# For each 3LO target (github/notion), update defaultReturnUrl:
-aws bedrock-agentcore-control update-gateway-target \
-  --gateway-identifier $GATEWAY_ID \
-  --target-id <TARGET_ID> \
-  --name <TARGET_NAME> \
-  --target-configuration '{"mcp":{"openApiSchema":{"inlinePayload":"..."}}}' \
-  --credential-provider-configurations '[{
-    "credentialProviderType": "OAUTH",
-    "credentialProvider": {
-      "oauthCredentialProvider": {
-        "providerArn": "<PROVIDER_ARN>",
-        "grantType": "AUTHORIZATION_CODE",
-        "defaultReturnUrl": "'$PROXY_URL'/3lo-callback",
-        "scopes": [...]
-      }
-    }
-  }]'
-```
-
 ## Key Files
 
 | File | Description |
 |------|-------------|
+| `package.json` / `pnpm-workspace.yaml` | pnpm workspace root — top-level `deploy` / `build` / `synth` scripts |
 | `cdk/bin/mcp-3lo-runtime-stack.ts` | CDK app entry point |
 | `cdk/bin/parameter.ts` | Deployment parameters (Zod-validated) |
 | `cdk/lib/cognito-stack.ts` | Shared Cognito User Pool |
-| `cdk/lib/gateway-stack.ts` | Unified Gateway + all targets + OAuth Proxy |
+| `cdk/lib/gateway-stack.ts` | Unified Gateway + Redash target + OAuth Proxy + Admin Panel wiring |
 | `cdk/lib/constructs-3lo/` | 3LO credential provider constructs (GitHub, Notion) |
-| `cdk/lib/constructs-apikey/` | API Key Swap constructs (DynamoDB, interceptor, Redash) |
+| `cdk/lib/constructs-apikey/` | API Key Swap — interceptor Lambda + Redash instance |
+| `cdk/lib/constructs-admin/` | Admin Panel — DynamoDB table, Cognito admin group, Admin REST API, S3+CloudFront SPA hosting |
 | `cdk/lib/constructs/` | Shared constructs (Cognito callback registration) |
 | `cdk/lambda/mcp_oauth_proxy.py` | OAuth proxy Lambda |
 | `cdk/lambda/notion_elicitation_interceptor.py` | Response interceptor (passthrough) |
-| `cdk/lambda/apikey_request_interceptor/` | API Key injection interceptor |
-| `cdk/openapi/github-api.yaml` | GitHub API OpenAPI spec |
-| `cdk/openapi/notion-api.yaml` | Notion API OpenAPI spec |
-| `cdk/openapi/redash-api.yaml` | Redash API OpenAPI spec |
+| `cdk/lambda/apikey_request_interceptor/` | API key injection interceptor (JWT claim → Admin Table lookup) |
+| `cdk/lambda/admin_api/` | Admin REST API handler — service + mapping CRUD |
+| `cdk/openapi/redash-api.yaml` | Redash API OpenAPI spec (still an OpenAPI target) |
+| `frontend/` | Admin Panel React SPA (Vite + React Router + Cognito Hosted UI / PKCE) |
+| `bin/sync-mcp-targets.py` | Out-of-CFN script that creates / updates GitHub & Notion MCP server targets with interactive OAuth consent |
 | `cdk/test/nag.test.ts` | cdk-nag security compliance tests |
 
 ## Testing
 
 ```bash
-cd cdk
-npm test
+pnpm test
 ```
 
 Runs [cdk-nag](https://github.com/cdklabs/cdk-nag) AwsSolutions checks against both stacks. Any new security finding will fail the test unless explicitly suppressed with a documented reason in `test/nag.test.ts`.
