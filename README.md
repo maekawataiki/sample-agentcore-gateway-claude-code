@@ -95,7 +95,44 @@ If a required field is missing or a client ID is set without its secret, `cdk sy
 
 ## Deployment
 
+### 0. Create OAuth Apps (optional, enables 3LO targets)
+
+#### GitHub OAuth App
+
+1. Go to [GitHub Developer Settings > OAuth Apps](https://github.com/settings/developers)
+2. Click **New OAuth App**
+3. Fill in the required fields (Application name, Homepage URL). Set **Authorization callback URL** to a placeholder — you will update it in [Step 7](#7-set-oauth-app-callback-urls-3lo-only) after deploy
+4. Click **Register application**
+5. Copy the **Client ID** and generate a **Client secret**
+
+#### Notion MCP OAuth Credentials (via DCR)
+
+This project connects to Notion's hosted MCP server (`mcp.notion.com`), which is a separate OAuth 2.1 authorization server from the Notion API (`api.notion.com`). Credentials must be obtained via Dynamic Client Registration (RFC 7591) against `mcp.notion.com` — **not** from the Notion Developer Dashboard (My Integrations).
+
+Run the provided script:
+
+```bash
+bin/register-notion-dcr.sh
+```
+
+This discovers the DCR endpoint via OAuth metadata (`/.well-known/oauth-protected-resource` → `/.well-known/oauth-authorization-server`), registers a client, and prints the `client_id` and `client_secret`.
+
+You can also pipe directly into environment variables:
+
+```bash
+eval $(bin/register-notion-dcr.sh --export)
+```
+
+Or append to a `.env` file:
+
+```bash
+bin/register-notion-dcr.sh --env .env
+```
+
+> **Why not the Notion Developer Dashboard?** The Notion Developer Dashboard issues credentials for `api.notion.com` (the Data API). Notion's MCP server at `mcp.notion.com` runs a separate OAuth 2.1 authorization server and only accepts clients registered via its own DCR endpoint.
+
 ### 1. Set OAuth secrets (optional, enables 3LO targets)
+
 
 ```bash
 export GITHUB_OAUTH_CLIENT_ID="..."
