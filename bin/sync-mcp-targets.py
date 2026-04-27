@@ -54,6 +54,24 @@ SERVICES = {
         "scopes": [],
         "provider_output": "NotionCredentialProviderArn",
     },
+    "slack": {
+        # Routed through the proxy's /slack-mcp handler (not directly to
+        # mcp.slack.com) to shim resources/templates/list. See
+        # handle_slack_mcp in mcp_oauth_proxy.py for details.
+        # Endpoint is composed at runtime from the GatewayStack's ProxyUrl.
+        "endpoint": "{ProxyUrl}/slack-mcp/mcp",
+        "scopes": [
+            "search:read.public", "search:read.private",
+            "search:read.mpim", "search:read.im",
+            "search:read.files", "search:read.users",
+            "chat:write",
+            "channels:history", "groups:history",
+            "mpim:history", "im:history",
+            "canvases:read", "canvases:write",
+            "users:read", "users:read.email",
+        ],
+        "provider_output": "SlackCredentialProviderArn",
+    },
 }
 
 
@@ -190,7 +208,9 @@ def cmd_create(service: str) -> None:
     # with CompleteResourceTokenAuth(userIdentifier={userToken:...}).
     # No local server / browser bootstrap is needed.
     return_url = f"{proxy_url}/3lo-callback"
+    endpoint = svc["endpoint"].format(ProxyUrl=proxy_url)
     print(f"Creating MCP target: {target_name}")
+    print(f"  endpoint: {endpoint}")
     print(f"  defaultReturnUrl: {return_url}")
     cred_config = {
         "credentialProviderType": "OAUTH",
@@ -208,7 +228,7 @@ def cmd_create(service: str) -> None:
         name=target_name,
         description=f"{service.title()} MCP server target (managed by sync-mcp-targets.py)",
         targetConfiguration={
-            "mcp": {"mcpServer": {"endpoint": svc["endpoint"]}},
+            "mcp": {"mcpServer": {"endpoint": endpoint}},
         },
         credentialProviderConfigurations=[cred_config],
     )

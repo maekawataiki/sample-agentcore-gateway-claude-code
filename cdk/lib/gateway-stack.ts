@@ -23,7 +23,7 @@ import * as cr from 'aws-cdk-lib/custom-resources'
 import * as fs from 'fs'
 import * as path from 'path'
 import { Construct } from 'constructs'
-import { GitHubCredentialProviderConstruct, NotionCredentialProviderConstruct } from './constructs-3lo'
+import { GitHubCredentialProviderConstruct, NotionCredentialProviderConstruct, SlackCredentialProviderConstruct } from './constructs-3lo'
 import { ApiKeyInterceptorLambdaConstruct, RedashInstanceConstruct } from './constructs-apikey'
 import { AdminTablesConstruct, CognitoAdminGroupConstruct, AdminApiConstruct, AdminFrontendConstruct } from './constructs-admin'
 import { CognitoCallbackRegistration } from './constructs/cognito-callback-registration'
@@ -40,6 +40,9 @@ export interface GatewayStackProps extends cdk.StackProps {
   // ── Notion 3LO (optional) ──
   readonly notionClientId?: string
   readonly notionClientSecret?: string
+  // ── Slack 3LO (optional) ──
+  readonly slackClientId?: string
+  readonly slackClientSecret?: string
   // ── Redash / API Key Swap ──
   readonly deployRedash?: boolean
   readonly redashUrl?: string
@@ -51,6 +54,7 @@ export class GatewayStack extends cdk.Stack {
 
     const hasGithub = !!(props.githubClientId && props.githubClientSecret)
     const hasNotion = !!(props.notionClientId && props.notionClientSecret)
+    const hasSlack = !!(props.slackClientId && props.slackClientSecret)
     const useRedash = props.deployRedash || !!props.redashUrl
 
     // ══════════════════════════════════════════════════════════════════════
@@ -308,6 +312,10 @@ export class GatewayStack extends cdk.Stack {
       )
     }
 
+    // ── Slack Credential Provider ──
+    // Created after httpApi because it needs the proxy URL for scope rewriting
+    let slackProvider: SlackCredentialProviderConstruct | undefined
+
     // ══════════════════════════════════════════════════════════════════════
     // OAuth Proxy (HTTP API + Lambda + DynamoDB)
     // ══════════════════════════════════════════════════════════════════════
@@ -364,6 +372,17 @@ export class GatewayStack extends cdk.Stack {
     const integration = new apigwv2integrations.HttpLambdaIntegration('Int', proxyLambda)
     httpApi.addRoutes({ path: '/{proxy+}', methods: [apigwv2.HttpMethod.ANY], integration })
     httpApi.addRoutes({ path: '/', methods: [apigwv2.HttpMethod.ANY], integration })
+
+    // ── Slack Credential Provider (needs proxy URL for scope rewriting) ──
+    if (hasSlack) {
+      slackProvider = new SlackCredentialProviderConstruct(
+        this, 'SlackProvider', {
+          uniqueId: 'slack',
+          clientId: props.slackClientId!,
+          clientSecret: props.slackClientSecret!,
+        },
+      )
+    }
 
     // ── HTTP API Access Logging ──
     const accessLogGroup = new logs.LogGroup(this, 'ProxyApiAccessLog', {
@@ -470,6 +489,14 @@ export class GatewayStack extends cdk.Stack {
       })
       new cdk.CfnOutput(this, 'NotionCredentialProviderArn', {
         value: notionProvider.credentialProviderArn,
+      })
+    }
+    if (slackProvider) {
+      new cdk.CfnOutput(this, 'SlackCredentialProviderName', {
+        value: slackProvider.credentialProviderName,
+      })
+      new cdk.CfnOutput(this, 'SlackCredentialProviderArn', {
+        value: slackProvider.credentialProviderArn,
       })
     }
   }

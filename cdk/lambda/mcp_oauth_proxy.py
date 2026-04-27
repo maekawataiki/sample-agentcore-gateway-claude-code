@@ -132,6 +132,14 @@ def lambda_handler(event, context):
     if path == "/3lo-callback":
         return handle_3lo_callback(event)
 
+    # ── Slack MCP relay (AgentCore strict-mode workaround) ──
+    # AgentCore marks the target FAILED when an MCP server returns -32601
+    # (Method not found) for `resources/templates/list`, which Slack MCP does
+    # because the method is optional in the spec. We intercept that one
+    # method and synthesize an empty result; everything else passes through.
+    if path.startswith("/slack-mcp"):
+        return handle_slack_mcp(event)
+
     # ── Health check ──
     if path == "/ping":
         return json_response(200, {"status": "ok"})
@@ -559,6 +567,79 @@ def _handle_tools_list_with_pagination(parsed_req, req_headers, auth, correlatio
         detail=f"mcp_method=tools/list pages={page + 1} tools={len(all_tools)}",
     )
     return {"statusCode": 200, "headers": resp_headers, "body": json.dumps(merged)}
+
+
+def handle_slack_mcp(event):
+    """Forward MCP requests to mcp.slack.com, but intercept
+    `resources/templates/list` and return an empty result.
+
+    AgentCore Gateway marks the target FAILED when an upstream MCP server
+    responds with JSON-RPC -32601 (Method not found) for that method, even
+    though the method is optional per the MCP spec. Slack MCP correctly
+    returns -32601, so we shim the response here to keep the target healthy.
+    """
+    method = (
+        event.get("httpMethod")
+        or event.get("requestContext", {}).get("http", {}).get("method", "POST")
+    )
+    body = event.get("body", "")
+    if event.get("isBase64Encoded") and body:
+        body = base64.b64decode(body)
+
+    # Intercept resources/templates/list before forwarding.
+    if method == "POST" and body:
+        try:
+            parsed = json.loads(body if isinstance(body, str) else body.decode())
+            if parsed.get("method") == "resources/templates/list":
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": parsed.get("id"),
+                        "result": {"resourceTemplates": []},
+                    }),
+                }
+        except (json.JSONDecodeError, AttributeError, UnicodeDecodeError):
+            pass
+
+    headers_in = event.get("headers") or {}
+    auth = headers_in.get("authorization") or headers_in.get("Authorization") or ""
+
+    fwd_headers = {
+        "Content-Type": headers_in.get("content-type") or headers_in.get("Content-Type") or "application/json",
+        "Accept": headers_in.get("accept") or headers_in.get("Accept") or "application/json, text/event-stream",
+    }
+    if auth:
+        fwd_headers["Authorization"] = auth
+    for h in ("mcp-protocol-version", "mcp-session-id", "user-agent"):
+        v = headers_in.get(h) or headers_in.get(h.title())
+        if v:
+            fwd_headers[h.title() if h != "user-agent" else "User-Agent"] = v
+
+    data = body.encode() if isinstance(body, str) else body
+    req = urllib.request.Request(
+        "https://mcp.slack.com/mcp", data=data or None, method=method, headers=fwd_headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_body = resp.read().decode()
+            resp_headers = {"Content-Type": resp.headers.get("Content-Type", "application/json")}
+            sid = resp.headers.get("Mcp-Session-Id")
+            if sid:
+                resp_headers["Mcp-Session-Id"] = sid
+            return {"statusCode": resp.status, "headers": resp_headers, "body": resp_body}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode()
+        resp_headers = {"Content-Type": e.headers.get("Content-Type", "application/json")}
+        www_auth = e.headers.get("WWW-Authenticate", "")
+        if www_auth:
+            resp_headers["WWW-Authenticate"] = www_auth
+        return {"statusCode": e.code, "headers": resp_headers, "body": err_body}
+    except Exception as e:
+        print(f"[SLACK-MCP] upstream exception {type(e).__name__}: {e}")
+        return {"statusCode": 502, "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"error": str(e)})}
 
 
 def proxy_to_gateway(event):

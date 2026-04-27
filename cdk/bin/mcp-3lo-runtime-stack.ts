@@ -25,6 +25,8 @@ new GatewayStack(app, 'GatewayStack', {
   githubClientSecret: params.githubClientSecret,
   notionClientId: params.notionClientId,
   notionClientSecret: params.notionClientSecret,
+  slackClientId: params.slackClientId,
+  slackClientSecret: params.slackClientSecret,
   deployRedash: params.deployRedash,
   redashUrl: params.redashUrl,
   env,
