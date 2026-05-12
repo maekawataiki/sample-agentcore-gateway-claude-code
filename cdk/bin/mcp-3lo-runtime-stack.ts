@@ -29,6 +29,8 @@ new GatewayStack(app, 'GatewayStack', {
   slackClientSecret: params.slackClientSecret,
   deployRedash: params.deployRedash,
   redashUrl: params.redashUrl,
+  redashHostedZoneName: params.redashHostedZoneName,
+  redashRecordName: params.redashRecordName,
   env,
   description: 'Unified MCP Gateway — GitHub, Notion, Redash via single endpoint',
 })

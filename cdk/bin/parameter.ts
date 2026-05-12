@@ -17,6 +17,11 @@ const ParameterSchema = z.object({
   // ── Redash / API Key Swap ──
   deployRedash: z.boolean().default(true),
   redashUrl: z.string().optional(),
+  // Public Route53 zone hosting the Redash record. The internal ALB only
+  // resolves from inside the VPC, but the cert is issued from a public CA so
+  // the zone itself must be a public hosted zone you own.
+  redashHostedZoneName: z.string().optional(),
+  redashRecordName: z.string().optional(),
 
   // ── GitHub 3LO (optional) ──
   githubClientId: z.string().optional(),
@@ -48,6 +53,8 @@ export const params: Parameters = ParameterSchema.parse({
   cognitoDomainPrefix: 'remote-mcp-gateway',
   deployRedash: true,
   redashUrl: undefined,
+  redashHostedZoneName: 'chat.tmae-aws.com',
+  redashRecordName: 'redash.chat.tmae-aws.com',
   githubClientId: process.env.GITHUB_OAUTH_CLIENT_ID || undefined,
   githubClientSecret: process.env.GITHUB_OAUTH_CLIENT_SECRET || undefined,
   notionClientId: process.env.NOTION_OAUTH_CLIENT_ID || undefined,

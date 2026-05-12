@@ -2,21 +2,29 @@ import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
-import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as targets from "aws-cdk-lib/aws-elasticloadbalancingv2-targets";
+import * as acm from "aws-cdk-lib/aws-certificatemanager";
+import * as route53 from "aws-cdk-lib/aws-route53";
+import * as r53targets from "aws-cdk-lib/aws-route53-targets";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { Construct } from "constructs";
 
 export interface RedashInstanceConstructProps {
   /** Admin DynamoDB table to write the service + default mapping into */
   readonly adminTable: dynamodb.Table;
+  /** Public Route53 hosted zone (e.g. "chat.tmae-aws.com") used to issue the
+   *  ACM cert and host the alias record. The record itself resolves to the
+   *  internal ALB and is only routable from inside the VPC. */
+  readonly hostedZoneName: string;
+  /** FQDN for the Redash ALB (e.g. "redash.chat.tmae-aws.com") */
+  readonly recordName: string;
 }
 
 /**
- * Deploys a Redash instance on EC2 with Docker Compose (Redash + PostgreSQL + Redis).
- * An API Gateway HTTP API is placed in front to provide an HTTPS endpoint
- * (required by AgentCore Gateway OpenAPI target validation).
+ * Deploys a Redash instance on EC2 with Docker Compose (Redash + PostgreSQL + Redis)
+ * behind an internal HTTPS ALB. The ALB uses a public ACM cert so AgentCore
+ * Gateway's VPC-egress target can validate it without needing a custom CA.
  *
  * On boot the UserData script:
  *   1. Installs Docker & Docker Compose
@@ -29,11 +37,16 @@ export interface RedashInstanceConstructProps {
  */
 export class RedashInstanceConstruct extends Construct {
   public readonly instance: ec2.Instance;
-  /** HTTPS URL for the Redash API (via API Gateway proxy) */
+  /** HTTPS URL for the Redash API (https://<recordName>) */
   public readonly redashUrl: string;
   /** Secrets Manager secret name containing Redash credentials */
   public readonly credentialsSecretName: string;
   public readonly vpc: ec2.IVpc;
+  /** Private subnets the Gateway VPC-egress endpoint should attach to */
+  public readonly privateSubnets: ec2.ISubnet[];
+  /** SG to attach to the Gateway VPC-egress ENIs. The ALB allows ingress
+   *  on 443 from this SG. */
+  public readonly gatewayEgressSg: ec2.SecurityGroup;
 
   constructor(
     scope: Construct,
@@ -61,23 +74,33 @@ export class RedashInstanceConstruct extends Construct {
         },
       ],
     });
+    this.privateSubnets = this.vpc.selectSubnets({
+      subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+    }).subnets;
 
     // ── Security Groups ──
-    // NLB Security Group (allows traffic from VPC)
-    const nlbSg = new ec2.SecurityGroup(this, "NlbSG", {
+    // Attached to the AgentCore Gateway VPC-egress ENIs (created by VPC Lattice).
+    this.gatewayEgressSg = new ec2.SecurityGroup(this, "GatewayEgressSG", {
       vpc: this.vpc,
-      description: "NLB - allow HTTP from VPC",
+      description: "AgentCore Gateway VPC-egress ENIs for Redash",
       allowAllOutbound: true,
     });
-    nlbSg.addIngressRule(ec2.Peer.ipv4(this.vpc.vpcCidrBlock), ec2.Port.tcp(80), "HTTP from VPC");
 
-    // EC2 Security Group (allows traffic only from NLB)
+    // ALB SG — accepts HTTPS only from the Gateway egress SG.
+    const albSg = new ec2.SecurityGroup(this, "AlbSG", {
+      vpc: this.vpc,
+      description: "Internal ALB for Redash - HTTPS from AgentCore Gateway",
+      allowAllOutbound: true,
+    });
+    albSg.addIngressRule(this.gatewayEgressSg, ec2.Port.tcp(443), "HTTPS from Gateway egress");
+
+    // EC2 SG — accepts Redash traffic only from the ALB.
     const sg = new ec2.SecurityGroup(this, "SG", {
       vpc: this.vpc,
-      description: "Redash instance - allow port 5000 from NLB only",
+      description: "Redash instance - allow port 5000 from ALB only",
       allowAllOutbound: true,
     });
-    sg.addIngressRule(nlbSg, ec2.Port.tcp(5000), "Redash HTTP from NLB");
+    sg.addIngressRule(albSg, ec2.Port.tcp(5000), "Redash HTTP from ALB");
 
     // ── IAM Role ──
     const role = new iam.Role(this, "Role", {
@@ -260,18 +283,28 @@ done`,
 
     cdk.Tags.of(this.instance).add("Name", `redash-${stack.stackName}`);
 
-    // ── Network Load Balancer (internal) ──
-    const nlb = new elbv2.NetworkLoadBalancer(this, "NLB", {
+    // ── Route53 + ACM ──
+    const hostedZone = route53.HostedZone.fromLookup(this, "HostedZone", {
+      domainName: props.hostedZoneName,
+    });
+
+    const certificate = new acm.Certificate(this, "Certificate", {
+      domainName: props.recordName,
+      validation: acm.CertificateValidation.fromDns(hostedZone),
+    });
+
+    // ── Internal Application Load Balancer ──
+    const alb = new elbv2.ApplicationLoadBalancer(this, "Alb", {
       vpc: this.vpc,
       internetFacing: false,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroups: [nlbSg],
+      securityGroup: albSg,
     });
 
-    const targetGroup = new elbv2.NetworkTargetGroup(this, "TargetGroup", {
+    const targetGroup = new elbv2.ApplicationTargetGroup(this, "TargetGroup", {
       vpc: this.vpc,
       port: 5000,
-      protocol: elbv2.Protocol.TCP,
+      protocol: elbv2.ApplicationProtocol.HTTP,
       targets: [new targets.InstanceTarget(this.instance, 5000)],
       healthCheck: {
         protocol: elbv2.Protocol.HTTP,
@@ -280,46 +313,22 @@ done`,
       },
     });
 
-    const listener = nlb.addListener("Listener", {
-      port: 80,
-      protocol: elbv2.Protocol.TCP,
+    alb.addListener("HttpsListener", {
+      port: 443,
+      protocol: elbv2.ApplicationProtocol.HTTPS,
+      certificates: [certificate],
       defaultTargetGroups: [targetGroup],
     });
 
-    // ── VPC Link ──
-    const vpcLink = new apigwv2.VpcLink(this, "VpcLink", {
-      vpc: this.vpc,
-      subnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroups: [nlbSg],
+    new route53.ARecord(this, "AliasRecord", {
+      zone: hostedZone,
+      recordName: props.recordName,
+      target: route53.RecordTarget.fromAlias(
+        new r53targets.LoadBalancerTarget(alb),
+      ),
     });
 
-    // ── API Gateway HTTP API (HTTPS → VPC Link → NLB → EC2:5000) ──
-    // AgentCore Gateway OpenAPI target requires HTTPS server URL.
-    const httpApi = new apigwv2.HttpApi(this, "HttpsProxy", {
-      apiName: `redash-proxy-${stack.stackName}`,
-      description: "HTTPS proxy for Redash EC2 instance via VPC Link",
-      createDefaultStage: true,
-    });
-
-    // Private integration to NLB via VPC Link (using L1 construct for VPC Link support)
-    const cfnIntegration = new apigwv2.CfnIntegration(this, "NlbIntegration", {
-      apiId: httpApi.httpApiId,
-      integrationType: "HTTP_PROXY",
-      integrationUri: listener.listenerArn,
-      integrationMethod: "ANY",
-      connectionType: "VPC_LINK",
-      connectionId: vpcLink.vpcLinkId,
-      payloadFormatVersion: "1.0",
-    });
-
-    new apigwv2.CfnRoute(this, "DefaultRoute", {
-      apiId: httpApi.httpApiId,
-      routeKey: "$default",
-      target: `integrations/${cfnIntegration.ref}`,
-    });
-
-    // HTTPS URL (e.g. https://xxxxx.execute-api.us-east-1.amazonaws.com)
-    this.redashUrl = httpApi.apiEndpoint;
+    this.redashUrl = `https://${props.recordName}`;
     this.credentialsSecretName = redashSecret.secretName;
   }
 }

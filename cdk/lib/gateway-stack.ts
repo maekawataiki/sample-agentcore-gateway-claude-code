@@ -20,8 +20,11 @@ import * as bedrockagentcore from 'aws-cdk-lib/aws-bedrockagentcore'
 import * as apigateway from 'aws-cdk-lib/aws-apigateway'
 import * as logs from 'aws-cdk-lib/aws-logs'
 import * as cr from 'aws-cdk-lib/custom-resources'
+import * as s3assets from 'aws-cdk-lib/aws-s3-assets'
 import * as fs from 'fs'
+import * as os from 'os'
 import * as path from 'path'
+import * as yaml from 'js-yaml'
 import { Construct } from 'constructs'
 import { GitHubCredentialProviderConstruct, NotionCredentialProviderConstruct, SlackCredentialProviderConstruct } from './constructs-3lo'
 import { ApiKeyInterceptorLambdaConstruct, RedashInstanceConstruct } from './constructs-apikey'
@@ -46,6 +49,10 @@ export interface GatewayStackProps extends cdk.StackProps {
   // ── Redash / API Key Swap ──
   readonly deployRedash?: boolean
   readonly redashUrl?: string
+  /** Public Route53 zone hosting the Redash record (only required when deployRedash=true) */
+  readonly redashHostedZoneName?: string
+  /** FQDN for the Redash internal ALB (only required when deployRedash=true) */
+  readonly redashRecordName?: string
 }
 
 export class GatewayStack extends cdk.Stack {
@@ -72,14 +79,20 @@ export class GatewayStack extends cdk.Stack {
     )
 
     let redashBackendUrl: string
+    let redashInstance: RedashInstanceConstruct | undefined
     if (props.deployRedash) {
-      const redash = new RedashInstanceConstruct(this, 'Redash', {
+      if (!props.redashHostedZoneName || !props.redashRecordName) {
+        throw new Error('redashHostedZoneName and redashRecordName are required when deployRedash=true')
+      }
+      redashInstance = new RedashInstanceConstruct(this, 'Redash', {
         adminTable: adminTables.table,
+        hostedZoneName: props.redashHostedZoneName,
+        recordName: props.redashRecordName,
       })
-      redashBackendUrl = redash.redashUrl
-      new cdk.CfnOutput(this, 'RedashUrl', { value: redash.redashUrl })
+      redashBackendUrl = redashInstance.redashUrl
+      new cdk.CfnOutput(this, 'RedashUrl', { value: redashInstance.redashUrl })
       new cdk.CfnOutput(this, 'RedashCredentialsSecret', {
-        value: redash.credentialsSecretName,
+        value: redashInstance.credentialsSecretName,
         description: 'aws secretsmanager get-secret-value --secret-id <this> --query SecretString --output text',
       })
     } else if (props.redashUrl) {
@@ -172,6 +185,21 @@ export class GatewayStack extends cdk.Stack {
               actions: ['lambda:InvokeFunction'],
               resources: [`arn:aws:lambda:${this.region}:${this.account}:function:*`],
             }),
+            // Required for VPC-egress targets (privateEndpoint.managedVpcResource).
+            // AgentCore validates and provisions VPC Lattice ENIs using these.
+            new iam.PolicyStatement({
+              actions: [
+                'ec2:DescribeVpcs',
+                'ec2:DescribeSubnets',
+                'ec2:DescribeSecurityGroups',
+                'ec2:DescribeNetworkInterfaces',
+                'ec2:CreateNetworkInterface',
+                'ec2:DeleteNetworkInterface',
+                'ec2:AssignPrivateIpAddresses',
+                'ec2:UnassignPrivateIpAddresses',
+              ],
+              resources: ['*'],
+            }),
           ],
         }),
       },
@@ -260,15 +288,39 @@ export class GatewayStack extends cdk.Stack {
       logRetention: logs.RetentionDays.THREE_MONTHS,
     })
 
-    const redashSpec = fs.readFileSync(
+    // AgentCore only accepts JSON for openApiSchema — convert YAML at synth time.
+    const redashSpecYaml = fs.readFileSync(
       path.join(__dirname, '../openapi/redash-api.yaml'), 'utf-8',
     ).replace('${RedashUrl}', redashBackendUrl)
+    const redashSpec = JSON.stringify(yaml.load(redashSpecYaml))
 
-    new bedrockagentcore.CfnGatewayTarget(this, 'RedashTarget', {
-      name: `redash-target-${this.stackName}`,
+    // Upload the rendered JSON spec as an S3 asset. The bedrock-agentcore
+    // CFN resource doesn't yet support `privateEndpoint`, so we drive the
+    // target via the control-plane API directly (AwsCustomResource). That
+    // route's CFN event payload is capped at 4KB, which the ~10KB spec blows
+    // through — hence the S3 reference.
+    const renderedSpecDir = path.join(os.tmpdir(), `redash-spec-${this.stackName}`)
+    fs.mkdirSync(renderedSpecDir, { recursive: true })
+    const renderedSpecPath = path.join(renderedSpecDir, 'redash-api.json')
+    fs.writeFileSync(renderedSpecPath, redashSpec)
+    const redashSpecAsset = new s3assets.Asset(this, 'RedashSpecAsset', {
+      path: renderedSpecPath,
+    })
+    redashSpecAsset.grantRead(gatewayRole)
+
+    const redashTargetName = `redash-target-vpc3-${this.stackName}`
+    const redashTargetParameters: { [k: string]: any } = {
       gatewayIdentifier: gateway.attrGatewayIdentifier,
+      name: redashTargetName,
       targetConfiguration: {
-        mcp: { openApiSchema: { inlinePayload: redashSpec } },
+        mcp: {
+          openApiSchema: {
+            s3: {
+              uri: redashSpecAsset.s3ObjectUrl,
+              bucketOwnerAccountId: this.account,
+            },
+          },
+        },
       },
       credentialProviderConfigurations: [{
         credentialProviderType: 'API_KEY',
@@ -280,7 +332,117 @@ export class GatewayStack extends cdk.Stack {
           },
         },
       }],
+    }
+    if (redashInstance) {
+      redashTargetParameters.privateEndpoint = {
+        managedVpcResource: {
+          vpcIdentifier: redashInstance.vpc.vpcId,
+          subnetIds: redashInstance.privateSubnets.map(s => s.subnetId),
+          securityGroupIds: [redashInstance.gatewayEgressSg.securityGroupId],
+          endpointIpAddressType: 'IPV4',
+        },
+      }
+    }
+
+    const redashTarget = new cr.AwsCustomResource(this, 'RedashTargetVpc3', {
+      onCreate: {
+        service: 'bedrock-agentcore-control',
+        action: 'CreateGatewayTarget',
+        parameters: redashTargetParameters,
+        physicalResourceId: cr.PhysicalResourceId.fromResponse('targetId'),
+      },
+      onUpdate: {
+        service: 'bedrock-agentcore-control',
+        action: 'UpdateGatewayTarget',
+        parameters: {
+          ...redashTargetParameters,
+          targetId: new cr.PhysicalResourceIdReference(),
+        },
+        physicalResourceId: cr.PhysicalResourceId.fromResponse('targetId'),
+      },
+      onDelete: {
+        service: 'bedrock-agentcore-control',
+        action: 'DeleteGatewayTarget',
+        parameters: {
+          gatewayIdentifier: gateway.attrGatewayIdentifier,
+          targetId: new cr.PhysicalResourceIdReference(),
+        },
+        // If create failed, physicalResourceId falls back to the Lambda log
+        // stream id, which violates the targetId regex. Swallow the resulting
+        // ValidationException so rollback can proceed. Also tolerate already-
+        // deleted targets on stack tear-down.
+        ignoreErrorCodesMatching: 'ValidationException|ResourceNotFoundException',
+      },
+      policy: cr.AwsCustomResourcePolicy.fromStatements([
+        new iam.PolicyStatement({
+          actions: [
+            'bedrock-agentcore:CreateGatewayTarget',
+            'bedrock-agentcore:UpdateGatewayTarget',
+            'bedrock-agentcore:DeleteGatewayTarget',
+            'bedrock-agentcore:GetGatewayTarget',
+            // Internally invoked by Create/Update for targets with privateEndpoint
+            'bedrock-agentcore:SynchronizeGatewayTargets',
+          ],
+          resources: [`arn:aws:bedrock-agentcore:${this.region}:${this.account}:*`],
+        }),
+        new iam.PolicyStatement({
+          actions: ['iam:PassRole'],
+          resources: [gatewayRole.roleArn],
+          conditions: {
+            StringEquals: { 'iam:PassedToService': 'bedrock-agentcore.amazonaws.com' },
+          },
+        }),
+        // CreateGatewayTarget validates the S3 OpenAPI reference at call time
+        // using the caller's credentials, so the CR lambda needs read access.
+        new iam.PolicyStatement({
+          actions: ['s3:GetObject'],
+          resources: [redashSpecAsset.bucket.arnForObjects(redashSpecAsset.s3ObjectKey)],
+        }),
+        // CreateGatewayTarget with privateEndpoint provisions VPC Lattice
+        // ENIs as the caller. Grant the full set required upfront.
+        new iam.PolicyStatement({
+          actions: [
+            'ec2:DescribeVpcs',
+            'ec2:DescribeSubnets',
+            'ec2:DescribeSecurityGroups',
+            'ec2:DescribeNetworkInterfaces',
+            'ec2:CreateNetworkInterface',
+            'ec2:DeleteNetworkInterface',
+            'ec2:ModifyNetworkInterfaceAttribute',
+            'ec2:AssignPrivateIpAddresses',
+            'ec2:UnassignPrivateIpAddresses',
+            'ec2:CreateTags',
+          ],
+          resources: ['*'],
+        }),
+        new iam.PolicyStatement({
+          actions: [
+            'vpc-lattice:CreateResourceConfiguration',
+            'vpc-lattice:UpdateResourceConfiguration',
+            'vpc-lattice:DeleteResourceConfiguration',
+            'vpc-lattice:GetResourceConfiguration',
+            'vpc-lattice:ListResourceConfigurations',
+            'vpc-lattice:CreateServiceNetworkResourceAssociation',
+            'vpc-lattice:DeleteServiceNetworkResourceAssociation',
+            'vpc-lattice:GetServiceNetworkResourceAssociation',
+          ],
+          resources: ['*'],
+        }),
+        // AgentCore creates AWSServiceRoleForBedrockAgentCoreGatewayNetwork on
+        // first use of a VPC-egress target. Allow only that specific SLR.
+        new iam.PolicyStatement({
+          actions: ['iam:CreateServiceLinkedRole'],
+          resources: [
+            `arn:aws:iam::${this.account}:role/aws-service-role/bedrock-agentcore.amazonaws.com/AWSServiceRoleForBedrockAgentCoreGatewayNetwork`,
+          ],
+        }),
+      ]),
+      // The privateEndpoint field was added after the SDK bundled in the Lambda
+      // runtime — install the latest SDK at invocation time so it's recognised.
+      installLatestAwsSdk: true,
+      logRetention: logs.RetentionDays.THREE_MONTHS,
     })
+    redashTarget.node.addDependency(redashSpecAsset)
 
     // ── GitHub Credential Provider ──
     // Target creation is handled by bin/sync-mcp-targets.sh (outside CDK)
