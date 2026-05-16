@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import 'source-map-support/register'
 import * as cdk from 'aws-cdk-lib'
 import { CognitoStack } from '../lib/cognito-stack'
 import { GatewayStack } from '../lib/gateway-stack'
@@ -27,6 +26,7 @@ new GatewayStack(app, 'GatewayStack', {
   notionClientSecret: params.notionClientSecret,
   slackClientId: params.slackClientId,
   slackClientSecret: params.slackClientSecret,
+  deployGithubBot: params.deployGithubBot,
   deployRedash: params.deployRedash,
   redashUrl: params.redashUrl,
   redashHostedZoneName: params.redashHostedZoneName,

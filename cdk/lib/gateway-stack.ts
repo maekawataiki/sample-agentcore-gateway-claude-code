@@ -17,6 +17,7 @@ import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2'
 import * as apigwv2integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations'
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb'
 import * as bedrockagentcore from 'aws-cdk-lib/aws-bedrockagentcore'
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager'
 import * as apigateway from 'aws-cdk-lib/aws-apigateway'
 import * as logs from 'aws-cdk-lib/aws-logs'
 import * as cr from 'aws-cdk-lib/custom-resources'
@@ -46,6 +47,8 @@ export interface GatewayStackProps extends cdk.StackProps {
   // ── Slack 3LO (optional) ──
   readonly slackClientId?: string
   readonly slackClientSecret?: string
+  // ── GitHub bot (PAT-injection proxy, optional) ──
+  readonly deployGithubBot?: boolean
   // ── Redash / API Key Swap ──
   readonly deployRedash?: boolean
   readonly redashUrl?: string
@@ -62,6 +65,7 @@ export class GatewayStack extends cdk.Stack {
     const hasGithub = !!(props.githubClientId && props.githubClientSecret)
     const hasNotion = !!(props.notionClientId && props.notionClientSecret)
     const hasSlack = !!(props.slackClientId && props.slackClientSecret)
+    const hasGithubBot = !!props.deployGithubBot
     const useRedash = props.deployRedash || !!props.redashUrl
 
     // ══════════════════════════════════════════════════════════════════════
@@ -491,6 +495,32 @@ export class GatewayStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     })
 
+    // ── GitHub bot PAT secret (machine-to-machine GitHub MCP access) ──
+    // The proxy injects this PAT as `Authorization: Bearer …` on outbound
+    // calls to api.githubcopilot.com/mcp/. CDK seeds the secret with a
+    // random placeholder; replace it with the real PAT after deploy:
+    //   aws secretsmanager put-secret-value --secret-id <arn> --secret-string ghp_xxx
+    // The proxy treats anything that isn't a valid PAT as a 401 → cache
+    // invalidation, so the next request after put-secret-value picks up
+    // the new value.
+    let githubBotPatSecret: secretsmanager.Secret | undefined
+    if (hasGithubBot) {
+      githubBotPatSecret = new secretsmanager.Secret(this, 'GitHubBotPat', {
+        secretName: `github-bot-pat-${this.stackName}`,
+        description: 'GitHub bot PAT used by /github-mcp proxy to call api.githubcopilot.com',
+      })
+    }
+
+    const proxyEnvironment: { [k: string]: string } = {
+      GATEWAY_URL: gateway.attrGatewayUrl,
+      COGNITO_DOMAIN: props.cognitoDomain,
+      COGNITO_CLIENT_ID: props.cognitoClientId,
+      SESSION_TABLE_NAME: sessionTable.tableName,
+    }
+    if (githubBotPatSecret) {
+      proxyEnvironment.GITHUB_BOT_PAT_SECRET_ARN = githubBotPatSecret.secretArn
+    }
+
     const proxyLambda = new lambda.Function(this, 'ProxyLambda', {
       functionName: `oauth-proxy-${this.stackName}`,
       runtime: lambda.Runtime.PYTHON_3_13,
@@ -506,12 +536,7 @@ export class GatewayStack extends cdk.Stack {
       memorySize: 256,
       description: 'Unified OAuth proxy — Cognito facade + MCP forwarding + 3LO callback',
       tracing: lambda.Tracing.ACTIVE,
-      environment: {
-        GATEWAY_URL: gateway.attrGatewayUrl,
-        COGNITO_DOMAIN: props.cognitoDomain,
-        COGNITO_CLIENT_ID: props.cognitoClientId,
-        SESSION_TABLE_NAME: sessionTable.tableName,
-      },
+      environment: proxyEnvironment,
       logRetention: logs.RetentionDays.THREE_MONTHS,
     })
     proxyLambda.addToRolePolicy(new iam.PolicyStatement({
@@ -659,6 +684,12 @@ export class GatewayStack extends cdk.Stack {
       })
       new cdk.CfnOutput(this, 'SlackCredentialProviderArn', {
         value: slackProvider.credentialProviderArn,
+      })
+    }
+    if (githubBotPatSecret) {
+      new cdk.CfnOutput(this, 'GitHubBotPatSecretArn', {
+        value: githubBotPatSecret.secretArn,
+        description: 'Set with: aws secretsmanager put-secret-value --secret-id <this> --secret-string ghp_xxx',
       })
     }
   }

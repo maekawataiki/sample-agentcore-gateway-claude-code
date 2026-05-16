@@ -36,6 +36,7 @@ GATEWAY_URL = os.environ["GATEWAY_URL"]
 COGNITO_DOMAIN = os.environ["COGNITO_DOMAIN"]
 COGNITO_CLIENT_ID = os.environ["COGNITO_CLIENT_ID"]
 SESSION_TABLE_NAME = os.environ.get("SESSION_TABLE_NAME", "")
+GITHUB_BOT_PAT_SECRET_ARN = os.environ.get("GITHUB_BOT_PAT_SECRET_ARN", "")
 
 # Allowed redirect_uri hosts for OAuth callback (prevent open redirect)
 _ALLOWED_REDIRECT_HOSTS = {"127.0.0.1", "localhost"}
@@ -139,6 +140,14 @@ def lambda_handler(event, context):
     # method and synthesize an empty result; everything else passes through.
     if path.startswith("/slack-mcp"):
         return handle_slack_mcp(event)
+
+    # ── GitHub MCP relay (PAT injection for machine-to-machine bots) ──
+    # GitHub remote MCP only accepts OAuth (3LO) or PAT — there is no 2LO
+    # path. For bot workloads we point the gateway target at this proxy
+    # with No-auth and inject `Authorization: Bearer <PAT>` here, sourced
+    # from Secrets Manager.
+    if path.startswith("/github-mcp"):
+        return handle_github_mcp(event)
 
     # ── Health check ──
     if path == "/ping":
@@ -638,6 +647,104 @@ def handle_slack_mcp(event):
         return {"statusCode": e.code, "headers": resp_headers, "body": err_body}
     except Exception as e:
         print(f"[SLACK-MCP] upstream exception {type(e).__name__}: {e}")
+        return {"statusCode": 502, "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"error": str(e)})}
+
+
+# ─── GitHub MCP PAT-injection relay ────────────────────────────────────────
+
+_GITHUB_PAT_CACHE = {"value": None, "expires_at": 0.0}
+_GITHUB_PAT_TTL = 300  # seconds
+
+
+def _get_github_bot_pat():
+    """Return the GitHub bot PAT, cached for _GITHUB_PAT_TTL seconds.
+
+    Lambda execution environments live ~15min idle so a short TTL is enough
+    to avoid hitting Secrets Manager on every invocation while still letting
+    rotation propagate within a few minutes.
+    """
+    now = time.time()
+    if _GITHUB_PAT_CACHE["value"] and _GITHUB_PAT_CACHE["expires_at"] > now:
+        return _GITHUB_PAT_CACHE["value"]
+    if not GITHUB_BOT_PAT_SECRET_ARN:
+        raise RuntimeError("GITHUB_BOT_PAT_SECRET_ARN env var is not set")
+    sm = boto3.client("secretsmanager")
+    resp = sm.get_secret_value(SecretId=GITHUB_BOT_PAT_SECRET_ARN)
+    secret_str = resp.get("SecretString") or ""
+    # Allow either a raw PAT or a JSON blob like {"pat": "ghp_..."} for ergonomics.
+    pat = secret_str.strip()
+    if pat.startswith("{"):
+        try:
+            pat = json.loads(pat).get("pat", "").strip()
+        except json.JSONDecodeError:
+            pass
+    if not pat:
+        raise RuntimeError("GitHub bot PAT secret is empty")
+    _GITHUB_PAT_CACHE["value"] = pat
+    _GITHUB_PAT_CACHE["expires_at"] = now + _GITHUB_PAT_TTL
+    return pat
+
+
+def handle_github_mcp(event):
+    """Forward MCP requests to api.githubcopilot.com/mcp/, injecting a
+    bot PAT in the Authorization header from Secrets Manager.
+
+    The inbound caller is authenticated by AgentCore Gateway (CUSTOM_JWT)
+    before requests reach this proxy via the No-auth MCP target, so the
+    inbound Authorization is intentionally ignored here.
+    """
+    method = (
+        event.get("httpMethod")
+        or event.get("requestContext", {}).get("http", {}).get("method", "POST")
+    )
+    body = event.get("body", "")
+    if event.get("isBase64Encoded") and body:
+        body = base64.b64decode(body)
+
+    try:
+        pat = _get_github_bot_pat()
+    except Exception as e:
+        print(f"[GITHUB-MCP] PAT resolution failed: {type(e).__name__}: {e}")
+        return {"statusCode": 500, "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"error": "github_pat_unavailable"})}
+
+    headers_in = event.get("headers") or {}
+    fwd_headers = {
+        "Authorization": f"Bearer {pat}",
+        "Content-Type": headers_in.get("content-type") or headers_in.get("Content-Type") or "application/json",
+        "Accept": headers_in.get("accept") or headers_in.get("Accept") or "application/json, text/event-stream",
+    }
+    for h in ("mcp-protocol-version", "mcp-session-id", "user-agent"):
+        v = headers_in.get(h) or headers_in.get(h.title())
+        if v:
+            fwd_headers[h.title() if h != "user-agent" else "User-Agent"] = v
+
+    data = body.encode() if isinstance(body, str) else body
+    req = urllib.request.Request(
+        "https://api.githubcopilot.com/mcp/", data=data or None, method=method, headers=fwd_headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_body = resp.read().decode()
+            resp_headers = {"Content-Type": resp.headers.get("Content-Type", "application/json")}
+            sid = resp.headers.get("Mcp-Session-Id")
+            if sid:
+                resp_headers["Mcp-Session-Id"] = sid
+            return {"statusCode": resp.status, "headers": resp_headers, "body": resp_body}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode()
+        resp_headers = {"Content-Type": e.headers.get("Content-Type", "application/json")}
+        www_auth = e.headers.get("WWW-Authenticate", "")
+        if www_auth:
+            resp_headers["WWW-Authenticate"] = www_auth
+        # On 401/403 invalidate the cache so a rotated PAT is picked up next call.
+        if e.code in (401, 403):
+            _GITHUB_PAT_CACHE["value"] = None
+            _GITHUB_PAT_CACHE["expires_at"] = 0.0
+        return {"statusCode": e.code, "headers": resp_headers, "body": err_body}
+    except Exception as e:
+        print(f"[GITHUB-MCP] upstream exception {type(e).__name__}: {e}")
         return {"statusCode": 502, "headers": {"Content-Type": "application/json"},
                 "body": json.dumps({"error": str(e)})}
 

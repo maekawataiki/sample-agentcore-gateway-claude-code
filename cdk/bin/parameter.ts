@@ -34,6 +34,9 @@ const ParameterSchema = z.object({
   // ── Slack 3LO (optional) ──
   slackClientId: z.string().optional(),
   slackClientSecret: z.string().optional(),
+
+  // ── GitHub bot (PAT-injection proxy, optional) ──
+  deployGithubBot: z.boolean().default(false),
 }).refine(
   (p) => !p.githubClientId || p.githubClientSecret,
   { message: 'githubClientSecret is required when githubClientId is set' },
@@ -61,4 +64,5 @@ export const params: Parameters = ParameterSchema.parse({
   notionClientSecret: process.env.NOTION_OAUTH_CLIENT_SECRET || undefined,
   slackClientId: process.env.SLACK_OAUTH_CLIENT_ID || undefined,
   slackClientSecret: process.env.SLACK_OAUTH_CLIENT_SECRET || undefined,
+  deployGithubBot: process.env.DEPLOY_GITHUB_BOT === 'true',
 })

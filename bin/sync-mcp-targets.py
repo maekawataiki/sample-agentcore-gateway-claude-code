@@ -72,6 +72,16 @@ SERVICES = {
         ],
         "provider_output": "SlackCredentialProviderArn",
     },
+    "github-bot": {
+        # Machine-to-machine GitHub MCP access. Routed through the proxy's
+        # /github-mcp handler, which injects `Authorization: Bearer <PAT>`
+        # from Secrets Manager (GitHubBotPatSecretArn). The MCP target is
+        # registered with No-auth — outbound auth is the proxy's job.
+        # See handle_github_mcp in mcp_oauth_proxy.py.
+        "endpoint": "{ProxyUrl}/github-mcp/mcp",
+        "scopes": [],
+        "provider_output": None,  # No-auth: skip credentialProviderConfigurations
+    },
 }
 
 
@@ -181,9 +191,10 @@ def cmd_create(service: str) -> None:
     svc = SERVICES[service]
     outputs = _get_stack_outputs()
     gateway_id = outputs["GatewayId"]
-    provider_arn = outputs.get(svc["provider_output"])
+    no_auth = svc["provider_output"] is None
+    provider_arn = None if no_auth else outputs.get(svc["provider_output"])
 
-    if not provider_arn:
+    if not no_auth and not provider_arn:
         print(f"Error: {svc['provider_output']} not found in stack outputs.")
         print(f"Did you set the {service} OAuth client ID/secret in parameter.ts?")
         sys.exit(1)
@@ -211,27 +222,32 @@ def cmd_create(service: str) -> None:
     endpoint = svc["endpoint"].format(ProxyUrl=proxy_url)
     print(f"Creating MCP target: {target_name}")
     print(f"  endpoint: {endpoint}")
-    print(f"  defaultReturnUrl: {return_url}")
-    cred_config = {
-        "credentialProviderType": "OAUTH",
-        "credentialProvider": {
-            "oauthCredentialProvider": {
-                "providerArn": provider_arn,
-                "grantType": "AUTHORIZATION_CODE",
-                "defaultReturnUrl": return_url,
-                "scopes": svc["scopes"],
-            },
-        },
+    create_kwargs = {
+        "gatewayIdentifier": gateway_id,
+        "name": target_name,
+        "description": f"{service.title()} MCP server target (managed by sync-mcp-targets.py)",
+        "targetConfiguration": {"mcp": {"mcpServer": {"endpoint": endpoint}}},
     }
-    resp = cp.create_gateway_target(
-        gatewayIdentifier=gateway_id,
-        name=target_name,
-        description=f"{service.title()} MCP server target (managed by sync-mcp-targets.py)",
-        targetConfiguration={
-            "mcp": {"mcpServer": {"endpoint": endpoint}},
-        },
-        credentialProviderConfigurations=[cred_config],
-    )
+    if no_auth:
+        # MCP target with No-auth — outbound auth is handled by the proxy
+        # (see handle_github_mcp). Omitting credentialProviderConfigurations
+        # leaves the gateway calling the endpoint without an Authorization
+        # header, so the proxy's injected header reaches GitHub MCP cleanly.
+        print("  authorization: No-auth (proxy injects bearer)")
+    else:
+        print(f"  defaultReturnUrl: {return_url}")
+        create_kwargs["credentialProviderConfigurations"] = [{
+            "credentialProviderType": "OAUTH",
+            "credentialProvider": {
+                "oauthCredentialProvider": {
+                    "providerArn": provider_arn,
+                    "grantType": "AUTHORIZATION_CODE",
+                    "defaultReturnUrl": return_url,
+                    "scopes": svc["scopes"],
+                },
+            },
+        }]
+    resp = cp.create_gateway_target(**create_kwargs)
 
     target_id = resp["targetId"]
     status = resp.get("status", "UNKNOWN")
@@ -249,15 +265,27 @@ def cmd_create(service: str) -> None:
     _ssm_put(f"{service}/targetId", target_id)
     _ssm_put(f"{service}/targetName", target_name)
 
-    # No interactive admin onboarding — end-user authorization happens
-    # lazily via the MCP elicitation flow when the first tool call is made
-    # from a client. Print guidance and exit.
-    print()
-    print(f"Target is pending end-user authorization (status={status}).")
-    print(f"To complete setup, invoke any {service} tool from an MCP client")
-    print(f"(Claude Code, etc.). The client will receive an elicitation")
-    print(f"prompting the user to authorize {service}; the proxy's")
-    print(f"/3lo-callback endpoint handles session binding automatically.")
+    if no_auth:
+        # For No-auth targets the gateway calls tools/list directly; status
+        # should advance to READY (or FAILED) without any user consent step.
+        # Make sure the proxy's injected PAT secret is populated first.
+        print()
+        print(f"Target created with No-auth (status={status}).")
+        secret_arn = outputs.get("GitHubBotPatSecretArn")
+        if secret_arn:
+            print("Ensure the bot PAT secret is set before invoking tools:")
+            print(f"  aws secretsmanager put-secret-value --secret-id {secret_arn} \\")
+            print("    --secret-string ghp_xxxxxxxxxxxxxxxxxxxxx")
+    else:
+        # No interactive admin onboarding — end-user authorization happens
+        # lazily via the MCP elicitation flow when the first tool call is made
+        # from a client. Print guidance and exit.
+        print()
+        print(f"Target is pending end-user authorization (status={status}).")
+        print(f"To complete setup, invoke any {service} tool from an MCP client")
+        print(f"(Claude Code, etc.). The client will receive an elicitation")
+        print(f"prompting the user to authorize {service}; the proxy's")
+        print(f"/3lo-callback endpoint handles session binding automatically.")
 
 
 def cmd_status(service: str) -> None:
