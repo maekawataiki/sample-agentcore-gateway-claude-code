@@ -15,6 +15,7 @@ import * as iam from 'aws-cdk-lib/aws-iam'
 import * as lambda from 'aws-cdk-lib/aws-lambda'
 import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2'
 import * as apigwv2integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations'
+import { HttpIamAuthorizer } from 'aws-cdk-lib/aws-apigatewayv2-authorizers'
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb'
 import * as bedrockagentcore from 'aws-cdk-lib/aws-bedrockagentcore'
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager'
@@ -557,8 +558,23 @@ export class GatewayStack extends cdk.Stack {
       description: 'Unified MCP OAuth proxy for all Gateway targets',
     })
     const integration = new apigwv2integrations.HttpLambdaIntegration('Int', proxyLambda)
+    // /github-mcp injects a shared bot PAT, so it must only be reachable by the
+    // gateway itself (SigV4 via its service role), never directly. Protect it
+    // with IAM auth; all other routes (OAuth flow, /mcp) stay public.
+    const iamAuthorizer = new HttpIamAuthorizer()
+    httpApi.addRoutes({ path: '/github-mcp', methods: [apigwv2.HttpMethod.ANY], integration, authorizer: iamAuthorizer })
+    httpApi.addRoutes({ path: '/github-mcp/{proxy+}', methods: [apigwv2.HttpMethod.ANY], integration, authorizer: iamAuthorizer })
     httpApi.addRoutes({ path: '/{proxy+}', methods: [apigwv2.HttpMethod.ANY], integration })
     httpApi.addRoutes({ path: '/', methods: [apigwv2.HttpMethod.ANY], integration })
+
+    // Let the gateway service role invoke the IAM-protected /github-mcp routes
+    // (github-bot target uses GATEWAY_IAM_ROLE / SigV4 outbound auth).
+    if (hasGithubBot) {
+      gatewayRole.addToPolicy(new iam.PolicyStatement({
+        actions: ['execute-api:Invoke'],
+        resources: [`arn:aws:execute-api:${this.region}:${this.account}:${httpApi.apiId}/*/*/github-mcp*`],
+      }))
+    }
 
     // ── Slack Credential Provider (needs proxy URL for scope rewriting) ──
     if (hasSlack) {

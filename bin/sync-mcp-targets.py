@@ -73,14 +73,15 @@ SERVICES = {
         "provider_output": "SlackCredentialProviderArn",
     },
     "github-bot": {
-        # Machine-to-machine GitHub MCP access. Routed through the proxy's
-        # /github-mcp handler, which injects `Authorization: Bearer <PAT>`
-        # from Secrets Manager (GitHubBotPatSecretArn). The MCP target is
-        # registered with No-auth — outbound auth is the proxy's job.
-        # See handle_github_mcp in mcp_oauth_proxy.py.
+        # Machine-to-machine GitHub MCP access. The gateway calls the proxy's
+        # IAM-protected /github-mcp route (SigV4 via its service role), and the
+        # proxy injects `Authorization: Bearer <PAT>` from Secrets Manager
+        # (GitHubBotPatSecretArn). IAM auth ensures only the gateway can reach
+        # the PAT-injecting route. See handle_github_mcp in mcp_oauth_proxy.py.
         "endpoint": "{ProxyUrl}/github-mcp/mcp",
         "scopes": [],
-        "provider_output": None,  # No-auth: skip credentialProviderConfigurations
+        "auth": "iam",
+        "provider_output": None,  # IAM outbound: no credential provider ARN
     },
 }
 
@@ -228,12 +229,19 @@ def cmd_create(service: str) -> None:
         "description": f"{service.title()} MCP server target (managed by sync-mcp-targets.py)",
         "targetConfiguration": {"mcp": {"mcpServer": {"endpoint": endpoint}}},
     }
-    if no_auth:
-        # MCP target with No-auth — outbound auth is handled by the proxy
-        # (see handle_github_mcp). Omitting credentialProviderConfigurations
-        # leaves the gateway calling the endpoint without an Authorization
-        # header, so the proxy's injected header reaches GitHub MCP cleanly.
-        print("  authorization: No-auth (proxy injects bearer)")
+    if svc.get("auth") == "iam":
+        # IAM (SigV4) outbound: the gateway signs calls to the IAM-protected
+        # /github-mcp proxy route with its service role, so only the gateway can
+        # reach it. The proxy then injects the bot PAT toward GitHub MCP.
+        print("  authorization: IAM (gateway service role SigV4, execute-api)")
+        create_kwargs["credentialProviderConfigurations"] = [{
+            "credentialProviderType": "GATEWAY_IAM_ROLE",
+            "credentialProvider": {
+                "iamCredentialProvider": {"service": "execute-api"},
+            },
+        }]
+    elif no_auth:
+        print("  authorization: No-auth")
     else:
         print(f"  defaultReturnUrl: {return_url}")
         create_kwargs["credentialProviderConfigurations"] = [{
