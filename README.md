@@ -1,7 +1,7 @@
 # AgentCore Gateway Remote MCP Hub for Claude Code
 
 Amazon Bedrock AgentCore Gateway for Claude Code MCP integration.
-Single gateway with multiple targets (GitHub, Notion, Redash) — one Cognito login covers all tools.
+Single gateway with multiple targets (GitHub, Notion, Slack, Redash) — one Cognito login covers all tools.
 
 Based on the official AgentCore samples:
 - [IDE Gateway Tool (Serverless OAuth Proxy)](https://github.com/awslabs/agentcore-samples/tree/main/01-tutorials/02-AgentCore-gateway/04-integration/03-ide-gateway-tool) — OAuth proxy pattern for VS Code / Claude Code
@@ -32,6 +32,7 @@ The OAuth Proxy (Lambda behind API Gateway HTTP API) bridges this gap:
 1. **OAuth Authorization Server facade** — Serves its own RFC 9728 metadata (the `resource` identifier must match the URL the client connects to — the proxy URL, not the underlying Gateway URL) and proxies `/authorize` + `/token` to Cognito
 2. **MCP forwarding** — Forwards MCP requests to AgentCore Gateway with the Cognito JWT attached
 3. **3LO callback handling** — Receives the OAuth callback after user consent (GitHub / Notion), calls `CompleteResourceTokenAuth` to bind the token to the user's identity
+4. **Bot PAT injection** (optional) — The IAM-authorized `/github-mcp` route injects a shared GitHub PAT for machine-to-machine access. The gateway reaches it via SigV4 (its service role); direct calls are rejected, so it stays behind CUSTOM_JWT inbound auth
 
 ```
 Claude Code ──► API Gateway (HTTP API)
@@ -40,6 +41,8 @@ Claude Code ──► API Gateway (HTTP API)
                         ├─ /authorize      → Cognito hosted UI
                         ├─ /token          → Cognito token endpoint
                         ├─ /mcp            → AgentCore Gateway (JWT auth)
+                        ├─ /github-mcp     → GitHub MCP + bot PAT (IAM-auth only)
+                        ├─ /slack-mcp      → Slack MCP (resources/templates/list shim)
                         └─ /3lo-callback   → CompleteResourceTokenAuth
 ```
 
@@ -48,8 +51,9 @@ Claude Code ──► API Gateway (HTTP API)
 | Flow | Direction | When |
 |------|-----------|------|
 | **Inbound Auth** (Cognito) | Claude Code → OAuth Proxy → Cognito → JWT | On MCP server connection |
-| **Outbound 3LO** (GitHub / Notion) | AgentCore Gateway → SaaS OAuth → User consent → Token Vault | On first tool call to a 3LO target |
+| **Outbound 3LO** (GitHub / Notion / Slack) | AgentCore Gateway → SaaS OAuth → User consent → Token Vault | On first tool call to a 3LO target |
 | **API Key Swap** (Redash) | AgentCore Gateway → REQUEST Interceptor → Admin Table (JWT-claim match) → inject header | On every Redash tool call |
+| **Bot PAT** (GitHub bot, optional) | AgentCore Gateway → (SigV4, service role) → IAM-protected `/github-mcp` proxy route → inject `Authorization: Bearer <PAT>` | On every github-bot tool call |
 
 ### Operation Flow
 
@@ -62,7 +66,7 @@ Claude Code ──► API Gateway (HTTP API)
 | `CognitoStack` | Shared Cognito User Pool + App Client (us-east-1) |
 | `GatewayStack` | Unified Gateway + Redash target + OAuth Proxy + API-key Interceptor + Admin Panel (API + SPA) |
 
-> GitHub / Notion targets are **MCP server targets** (not OpenAPI) and are created outside CloudFormation by `bin/sync-mcp-targets.py` — CFN cannot handle Authorization Code-grant MCP targets because target creation requires interactive OAuth consent at create time. The Redash target remains an OpenAPI target and is created by CDK.
+> GitHub / Notion / Slack targets are **MCP server targets** (not OpenAPI), created outside CloudFormation by `bin/sync-mcp-targets.py` — CFN cannot handle Authorization Code-grant MCP targets (creation needs interactive OAuth consent). The optional `github-bot` target (machine-to-machine PAT) is created the same way. The Redash target remains an OpenAPI target created by CDK.
 
 ## Prerequisites
 
@@ -72,6 +76,8 @@ Claude Code ──► API Gateway (HTTP API)
 - An AWS account with Bedrock AgentCore access (us-east-1)
 - GitHub OAuth App (optional, for 3LO)
 - Notion Integration with OAuth (optional, for 3LO)
+- Slack app with OAuth (optional, for 3LO)
+- GitHub PAT (optional, for the machine-to-machine github-bot target)
 
 ## Configuration
 
@@ -88,6 +94,9 @@ export const params = ParameterSchema.parse({
   githubClientSecret: process.env.GITHUB_OAUTH_CLIENT_SECRET || undefined,
   notionClientId: process.env.NOTION_OAUTH_CLIENT_ID || undefined,
   notionClientSecret: process.env.NOTION_OAUTH_CLIENT_SECRET || undefined,
+  slackClientId: process.env.SLACK_OAUTH_CLIENT_ID || undefined,
+  slackClientSecret: process.env.SLACK_OAUTH_CLIENT_SECRET || undefined,
+  githubBotPat: process.env.GITHUB_BOT_PAT || undefined, // optional: enables the machine-to-machine github-bot target
 })
 ```
 
@@ -139,6 +148,12 @@ export GITHUB_OAUTH_CLIENT_ID="..."
 export GITHUB_OAUTH_CLIENT_SECRET="..."
 export NOTION_OAUTH_CLIENT_ID="..."
 export NOTION_OAUTH_CLIENT_SECRET="..."
+export SLACK_OAUTH_CLIENT_ID="..."
+export SLACK_OAUTH_CLIENT_SECRET="..."
+
+# Optional — enables the machine-to-machine GitHub bot target (GitHub PAT,
+# seeded into Secrets Manager at deploy).
+export GITHUB_BOT_PAT="ghp_..."
 ```
 
 ### 2. Deploy
@@ -157,6 +172,14 @@ pnpm sync-targets       # runs bin/sync-mcp-targets.py for github + notion
 ```
 
 The sync script opens a browser for one-time OAuth consent per service (required because MCP server targets with Authorization Code grant perform `tools/list` discovery during creation). Target IDs are stored in SSM Parameter Store so reruns are idempotent.
+
+For optional targets, create them individually (Slack uses interactive consent like GitHub/Notion; github-bot uses the seeded PAT, no consent):
+
+```bash
+python3 bin/sync-mcp-targets.py create slack       # if SLACK_OAUTH_* set
+python3 bin/sync-mcp-targets.py create github-bot  # if GITHUB_BOT_PAT set
+python3 bin/sync-mcp-targets.py status github-bot  # expect READY
+```
 
 ### 3. Retrieve Redash credentials (if `deployRedash: true`)
 
@@ -304,7 +327,7 @@ One entry covers all tools (GitHub, Notion, Redash).
 | `cdk/bin/parameter.ts` | Deployment parameters (Zod-validated) |
 | `cdk/lib/cognito-stack.ts` | Shared Cognito User Pool |
 | `cdk/lib/gateway-stack.ts` | Unified Gateway + Redash target + OAuth Proxy + Admin Panel wiring |
-| `cdk/lib/constructs-3lo/` | 3LO credential provider constructs (GitHub, Notion) |
+| `cdk/lib/constructs-3lo/` | 3LO credential provider constructs (GitHub, Notion, Slack) |
 | `cdk/lib/constructs-apikey/` | API Key Swap — interceptor Lambda + Redash instance |
 | `cdk/lib/constructs-admin/` | Admin Panel — DynamoDB table, Cognito admin group, Admin REST API, S3+CloudFront SPA hosting |
 | `cdk/lib/constructs/` | Shared constructs (Cognito callback registration) |
@@ -314,7 +337,7 @@ One entry covers all tools (GitHub, Notion, Redash).
 | `cdk/lambda/admin_api/` | Admin REST API handler — service + mapping CRUD |
 | `cdk/openapi/redash-api.yaml` | Redash API OpenAPI spec (still an OpenAPI target) |
 | `frontend/` | Admin Panel React SPA (Vite + React Router + Cognito Hosted UI / PKCE) |
-| `bin/sync-mcp-targets.py` | Out-of-CFN script that creates / updates GitHub & Notion MCP server targets with interactive OAuth consent |
+| `bin/sync-mcp-targets.py` | Out-of-CFN script that creates / updates MCP server targets: GitHub & Notion (interactive OAuth consent) and `github-bot` (IAM outbound to the PAT-injection proxy route) |
 | `cdk/test/nag.test.ts` | cdk-nag security compliance tests |
 
 ## Testing
@@ -347,6 +370,11 @@ Runs [cdk-nag](https://github.com/cdklabs/cdk-nag) AwsSolutions checks against b
 ### Auth link not displayed in Claude Code
 - The response interceptor must pass through `-32042` responses unchanged
 - MCP protocol version must be `2025-11-25`
+
+### github-bot target "not reachable"
+- Discovery hits GitHub with the seeded PAT, so `GITHUB_BOT_PAT` must be a valid GitHub PAT: `curl -H "Authorization: Bearer $GITHUB_BOT_PAT" https://api.github.com/user` (expect 200)
+- After fixing: redeploy, then `python3 bin/sync-mcp-targets.py delete github-bot && python3 bin/sync-mcp-targets.py create github-bot`
+- A direct (unsigned) call to `/github-mcp` returns 403 by design — only the gateway (SigV4) can reach it
 
 ## Observability
 

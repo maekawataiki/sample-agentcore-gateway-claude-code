@@ -49,7 +49,8 @@ export interface GatewayStackProps extends cdk.StackProps {
   readonly slackClientId?: string
   readonly slackClientSecret?: string
   // ── GitHub bot (PAT-injection proxy, optional) ──
-  readonly deployGithubBot?: boolean
+  /** GitHub bot PAT. When set, the github-bot target + IAM-protected proxy route are deployed. */
+  readonly githubBotPat?: string
   // ── Redash / API Key Swap ──
   readonly deployRedash?: boolean
   readonly redashUrl?: string
@@ -66,7 +67,7 @@ export class GatewayStack extends cdk.Stack {
     const hasGithub = !!(props.githubClientId && props.githubClientSecret)
     const hasNotion = !!(props.notionClientId && props.notionClientSecret)
     const hasSlack = !!(props.slackClientId && props.slackClientSecret)
-    const hasGithubBot = !!props.deployGithubBot
+    const hasGithubBot = !!props.githubBotPat
     const useRedash = props.deployRedash || !!props.redashUrl
 
     // ══════════════════════════════════════════════════════════════════════
@@ -497,18 +498,17 @@ export class GatewayStack extends cdk.Stack {
     })
 
     // ── GitHub bot PAT secret (machine-to-machine GitHub MCP access) ──
-    // The proxy injects this PAT as `Authorization: Bearer …` on outbound
-    // calls to api.githubcopilot.com/mcp/. CDK seeds the secret with a
-    // random placeholder; replace it with the real PAT after deploy:
-    //   aws secretsmanager put-secret-value --secret-id <arn> --secret-string ghp_xxx
-    // The proxy treats anything that isn't a valid PAT as a 401 → cache
-    // invalidation, so the next request after put-secret-value picks up
-    // the new value.
+    // Seeded at deploy from the GITHUB_BOT_PAT parameter (same env-var flow as
+    // the OAuth client secrets), so no post-deploy put-secret-value is needed.
+    // The proxy reads it at runtime and injects `Authorization: Bearer <PAT>`
+    // on the IAM-protected /github-mcp route. Rotate by updating GITHUB_BOT_PAT
+    // and redeploying.
     let githubBotPatSecret: secretsmanager.Secret | undefined
     if (hasGithubBot) {
       githubBotPatSecret = new secretsmanager.Secret(this, 'GitHubBotPat', {
         secretName: `github-bot-pat-${this.stackName}`,
-        description: 'GitHub bot PAT used by /github-mcp proxy to call api.githubcopilot.com',
+        secretStringValue: cdk.SecretValue.unsafePlainText(props.githubBotPat ?? ''),
+        description: 'GitHub bot PAT used by the /github-mcp proxy route',
       })
     }
 
@@ -705,7 +705,7 @@ export class GatewayStack extends cdk.Stack {
     if (githubBotPatSecret) {
       new cdk.CfnOutput(this, 'GitHubBotPatSecretArn', {
         value: githubBotPatSecret.secretArn,
-        description: 'Set with: aws secretsmanager put-secret-value --secret-id <this> --secret-string ghp_xxx',
+        description: 'Bot PAT secret (seeded at deploy from GITHUB_BOT_PAT)',
       })
     }
   }

@@ -274,16 +274,12 @@ def cmd_create(service: str) -> None:
     _ssm_put(f"{service}/targetName", target_name)
 
     if no_auth:
-        # For No-auth targets the gateway calls tools/list directly; status
-        # should advance to READY (or FAILED) without any user consent step.
-        # Make sure the proxy's injected PAT secret is populated first.
+        # github-bot: the PAT is seeded at deploy (GITHUB_BOT_PAT). During
+        # creation the gateway runs tools/list discovery via SigV4 against the
+        # IAM-protected /github-mcp route, so a valid PAT must already be set.
         print()
-        print(f"Target created with No-auth (status={status}).")
-        secret_arn = outputs.get("GitHubBotPatSecretArn")
-        if secret_arn:
-            print("Ensure the bot PAT secret is set before invoking tools:")
-            print(f"  aws secretsmanager put-secret-value --secret-id {secret_arn} \\")
-            print("    --secret-string ghp_xxxxxxxxxxxxxxxxxxxxx")
+        print(f"Target created (status={status}).")
+        print("If status is not READY, verify GITHUB_BOT_PAT is valid and redeploy GatewayStack.")
     else:
         # No interactive admin onboarding — end-user authorization happens
         # lazily via the MCP elicitation flow when the first tool call is made
