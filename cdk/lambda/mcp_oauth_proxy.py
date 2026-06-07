@@ -837,6 +837,13 @@ def proxy_to_gateway(event):
             # /3lo-callback can later bind the session with userToken.
             _cache_elicitation_token(resp_body, auth)
 
+            # Rewrite -32042 elicitation to URL text for clients that don't
+            # support native URL elicitation (e.g. Claude Cowork). Clients
+            # that do support it (e.g. Claude Code CLI) should send
+            # X-Supports-Elicitation: true in their MCP config headers.
+            if get_header(event, "X-Supports-Elicitation") != "true":
+                resp_body = _rewrite_elicitation_if_needed(resp_body)
+
             resp_headers = {
                 "Content-Type": resp.headers.get("Content-Type", "application/json"),
             }
@@ -871,6 +878,55 @@ def proxy_to_gateway(event):
             detail=f"mcp_method={mcp_method} exception={type(e).__name__}",
         )
         return json_response(502, {"error": {"code": -32603, "message": str(e)}})
+
+
+# ─── Elicitation rewrite ─────────────────────────────────────────────────────
+
+_ELICITATION_ERROR_CODE = -32042
+
+
+def _rewrite_elicitation_if_needed(resp_body):
+    """Rewrite -32042 elicitation error into a text result with the auth URL.
+
+    Clients that don't support URL elicitation (e.g. Claude Cowork) receive a
+    human-readable message with the authorization URL to visit manually. Returns
+    the original resp_body string unchanged if it is not a -32042 response.
+    """
+    try:
+        body = json.loads(resp_body)
+    except (json.JSONDecodeError, TypeError):
+        return resp_body
+
+    error = body.get("error") if isinstance(body, dict) else None
+    if not error or error.get("code") != _ELICITATION_ERROR_CODE:
+        return resp_body
+
+    elicitations = error.get("data", {}).get("elicitations", [])
+    url = elicitations[0].get("url", "") if elicitations else ""
+    message = (
+        (elicitations[0].get("message") if elicitations else None)
+        or error.get("message", "Authorization required")
+    )
+
+    if url:
+        text = (
+            f"{message}\n\n"
+            f"Please open this URL to authorize:\n{url}\n\n"
+            f"After authorizing, retry your request."
+        )
+    else:
+        text = f"{message}\n\nNo authorization URL was provided."
+
+    print(f"[ELICITATION] rewrote -32042 to text result. URL present: {bool(url)}")
+
+    rewritten = {
+        "jsonrpc": "2.0",
+        "id": body.get("id"),
+        "result": {
+            "content": [{"type": "text", "text": text}]
+        },
+    }
+    return json.dumps(rewritten)
 
 
 # ─── Session token cache (DynamoDB) ─────────────────────────────────────────
