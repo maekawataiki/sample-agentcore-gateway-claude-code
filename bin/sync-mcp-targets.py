@@ -40,6 +40,7 @@ REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 STACK_NAME = os.environ.get("STACK_NAME", "GatewayStack")
 CALLBACK_PORT = int(os.environ.get("CALLBACK_PORT", "18080"))
 CALLBACK_URL = f"http://localhost:{CALLBACK_PORT}/callback"
+SESSION_TABLE_NAME = f"3lo-sessions-{STACK_NAME}"
 
 SSM_PREFIX = f"/gateway/{STACK_NAME}/targets"
 
@@ -83,6 +84,19 @@ SERVICES = {
         "auth": "iam",
         "provider_output": None,  # IAM outbound: no credential provider ARN
     },
+    "datadog": {
+        # Datadog MCP (AP1 site). Public client — no client_secret (PKCE-only).
+        # Register via: MCP_HOST=mcp.ap1.datadoghq.com bin/register-datadog-dcr.sh --export
+        # For other sites set DATADOG_MCP_HOST env var and update endpoint accordingly.
+        "endpoint": os.environ.get(
+            "DATADOG_MCP_ENDPOINT",
+            "https://mcp.ap1.datadoghq.com/api/unstable/mcp-server/mcp",
+        ),
+        # Datadog MCP has scopes_supported:[] — the proxy's /datadog-authorize
+        # route strips any scope= param before forwarding to Datadog.
+        "scopes": [],
+        "provider_output": "DatadogCredentialProviderArn",
+    },
 }
 
 
@@ -117,6 +131,35 @@ def _ssm_get(key: str) -> str | None:
 
 def _ssm_put(key: str, value: str) -> None:
     _ssm().put_parameter(Name=f"{SSM_PREFIX}/{key}", Value=value, Type="String", Overwrite=True)
+
+
+def _dynamodb():
+    return boto3.resource("dynamodb", region_name=REGION)
+
+
+def _seed_admin_session(authorization_url: str, admin_user_id: str) -> None:
+    """Pre-seed DynamoDB so the proxy's /3lo-callback can bind the admin
+    session without needing a Cognito JWT (admin auth uses userId, not userToken).
+    """
+    parsed = urllib.parse.urlparse(authorization_url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    request_uri_raw = (qs.get("request_uri") or [None])[0]
+    if not request_uri_raw:
+        print("  (admin session seed skipped: no request_uri in authorizationUrl)")
+        return
+    request_uri = urllib.parse.unquote(request_uri_raw)
+    now = int(time.time())
+    try:
+        table = _dynamodb().Table(SESSION_TABLE_NAME)
+        table.put_item(Item={
+            "sessionUri": request_uri,
+            "userId": admin_user_id,
+            "cachedAt": now,
+            "ttl": now + 600,
+        })
+        print(f"  seeded admin session in DynamoDB: {request_uri[:80]}")
+    except Exception as e:
+        print(f"  WARNING: failed to seed admin session in DynamoDB: {e}")
 
 
 def _ssm_delete(key: str) -> None:
@@ -281,15 +324,38 @@ def cmd_create(service: str) -> None:
         print(f"Target created (status={status}).")
         print("If status is not READY, verify GITHUB_BOT_PAT is valid and redeploy GatewayStack.")
     else:
-        # No interactive admin onboarding — end-user authorization happens
-        # lazily via the MCP elicitation flow when the first tool call is made
-        # from a client. Print guidance and exit.
-        print()
-        print(f"Target is pending end-user authorization (status={status}).")
-        print(f"To complete setup, invoke any {service} tool from an MCP client")
-        print(f"(Claude Code, etc.). The client will receive an elicitation")
-        print(f"prompting the user to authorize {service}; the proxy's")
-        print(f"/3lo-callback endpoint handles session binding automatically.")
+        auth_data = resp.get("authorizationData", {}).get("oauth2", {})
+        auth_url = auth_data.get("authorizationUrl")
+        admin_user_id = auth_data.get("userId")
+
+        if auth_url and admin_user_id and status == "CREATE_PENDING_AUTH":
+            # AgentCore returned an admin auth URL — the gateway owner must
+            # authorize once to enable tool discovery. Pre-seed DynamoDB so the
+            # proxy's /3lo-callback uses the correct userId (not "default-user").
+            _seed_admin_session(auth_url, admin_user_id)
+            print()
+            print("Admin authorization required to complete target setup.")
+            print("Open this URL in your browser (valid for ~10 minutes):")
+            print(f"  {auth_url}")
+            print()
+            print("After authorizing, this script will poll until the target is READY.")
+            print("Press Ctrl+C to exit and poll manually with: python bin/sync-mcp-targets.py status " + service)
+            webbrowser.open(auth_url)
+            final_status = _poll_target(gateway_id, target_id, timeout=600)
+            if final_status == "READY":
+                print(f"Target {target_id} is READY.")
+            else:
+                print(f"Target {target_id} ended in status: {final_status}")
+                print("If still pending, retry authorization or check Lambda logs.")
+        else:
+            # No admin auth URL in response — end-user authorization happens
+            # lazily via the MCP elicitation flow when the first tool call is made.
+            print()
+            print(f"Target is pending end-user authorization (status={status}).")
+            print(f"To complete setup, invoke any {service} tool from an MCP client")
+            print(f"(Claude Code, etc.). The client will receive an elicitation")
+            print(f"prompting the user to authorize {service}; the proxy's")
+            print(f"/3lo-callback endpoint handles session binding automatically.")
 
 
 def cmd_status(service: str) -> None:

@@ -26,6 +26,8 @@ new GatewayStack(app, 'GatewayStack', {
   notionClientSecret: params.notionClientSecret,
   slackClientId: params.slackClientId,
   slackClientSecret: params.slackClientSecret,
+  datadogClientId: params.datadogClientId,
+  datadogMcpHost: params.datadogMcpHost,
   githubBotPat: params.githubBotPat,
   deployRedash: params.deployRedash,
   redashUrl: params.redashUrl,

@@ -37,6 +37,8 @@ COGNITO_DOMAIN = os.environ["COGNITO_DOMAIN"]
 COGNITO_CLIENT_ID = os.environ["COGNITO_CLIENT_ID"]
 SESSION_TABLE_NAME = os.environ.get("SESSION_TABLE_NAME", "")
 GITHUB_BOT_PAT_SECRET_ARN = os.environ.get("GITHUB_BOT_PAT_SECRET_ARN", "")
+DATADOG_TOKEN_ENDPOINT = os.environ.get("DATADOG_TOKEN_ENDPOINT", "")
+DATADOG_AUTHORIZE_ENDPOINT = os.environ.get("DATADOG_AUTHORIZE_ENDPOINT", "")
 
 # Allowed redirect_uri hosts for OAuth callback (prevent open redirect)
 _ALLOWED_REDIRECT_HOSTS = {"127.0.0.1", "localhost"}
@@ -149,6 +151,17 @@ def lambda_handler(event, context):
     if path.startswith("/github-mcp"):
         return handle_github_mcp(event)
 
+    # ── Datadog token relay ──
+    # Datadog MCP is a public OAuth client (PKCE-only, no client_secret).
+    # AgentCore's CustomOauth2 requires a non-empty clientSecret and always
+    # sends it via client_secret_post. We point the credential provider's
+    # tokenEndpoint here; the relay strips client_secret before forwarding
+    # to Datadog so PKCE-only clients authenticate correctly.
+    if path == "/datadog-authorize" and method == "GET":
+        return handle_datadog_authorize(event)
+    if path == "/datadog-token" and method == "POST":
+        return handle_datadog_token(event)
+
     # ── Health check ──
     if path == "/ping":
         return json_response(200, {"status": "ok"})
@@ -168,7 +181,7 @@ def handle_oauth_metadata(event):
         "authorization_endpoint": f"{api_url}/authorize",
         "token_endpoint": f"{api_url}/token",
         "registration_endpoint": f"{api_url}/register",
-        "scopes_supported": ["openid", "email", "profile"],
+        "scopes_supported": ["openid", "email", "profile", "phone"],
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "token_endpoint_auth_methods_supported": ["none"],
@@ -224,7 +237,7 @@ def handle_authorize(event):
         "state": compound_state,
         "response_type": "code",
     })
-    params.setdefault("scope", "openid email profile")
+    params.setdefault("scope", "openid email profile phone")
 
     cognito_url = (
         f"https://{COGNITO_DOMAIN}/oauth2/authorize?"
@@ -322,6 +335,7 @@ def handle_3lo_callback(event):
     correlation_id = event.get("requestContext", {}).get("requestId", "")
     params = event.get("queryStringParameters") or {}
     session_id = params.get("session_id", "")
+    authorization_code = params.get("code", "")
     error_param = params.get("error")
     src_ip = (
         event.get("requestContext", {}).get("http", {}).get("sourceIp")
@@ -353,29 +367,38 @@ def handle_3lo_callback(event):
         return html_response(400, "Missing session_id",
                              "The callback URL must include a session_id parameter.")
 
-    # Look up the caller JWT cached at elicitation-response interception
-    # time, keyed by the session URN in this callback.
-    user_token = _get_cached_token(session_id)
+    # Look up the caller JWT (per-user elicitation) or admin userId (target
+    # CREATE_PENDING_AUTH bootstrap) cached in DynamoDB keyed by session URN.
+    cached = _get_cached_entry(session_id)
+    user_token = cached.get("userToken") if cached else None
+    admin_user_id = cached.get("userId") if cached else None
     if user_token:
         user_identifier = {"userToken": user_token}
         identifier_type = "userToken"
+    elif admin_user_id:
+        user_identifier = {"userId": admin_user_id}
+        identifier_type = "userId(admin)"
     else:
         user_identifier = {"userId": "default-user"}
         identifier_type = "userId(fallback)"
-        print("[3LO-CALLBACK] WARNING: no cached token; falling back to userId")
+        print("[3LO-CALLBACK] WARNING: no cached entry; falling back to userId")
 
     region = os.environ.get("AWS_REGION", "us-east-1")
     api_url = f"https://bedrock-agentcore.{region}.amazonaws.com/identities/CompleteResourceTokenAuth"
 
-    body = json.dumps({
+    complete_body: dict = {
         "sessionUri": session_id,
         "userIdentifier": user_identifier,
-    })
+    }
+    if authorization_code:
+        complete_body["authorizationCode"] = authorization_code
+
+    body = json.dumps(complete_body)
 
     audit_log(
         action="3lo_callback",
         correlation_id=correlation_id,
-        detail=f"sessionUri={session_id[:60]}... identifierType={identifier_type}",
+        detail=f"sessionUri={session_id[:60]}... identifierType={identifier_type} hasCode={bool(authorization_code)}",
     )
 
     try:
@@ -749,6 +772,79 @@ def handle_github_mcp(event):
                 "body": json.dumps({"error": str(e)})}
 
 
+def handle_datadog_authorize(event):
+    """Redirect Datadog OAuth authorize requests with scope stripped.
+
+    AgentCore always sends scope= (even for empty scopes list). Datadog MCP has
+    scopes_supported:[] and rejects any scope value via invalid_scope. Strip it.
+    """
+    target = DATADOG_AUTHORIZE_ENDPOINT
+    if not target:
+        return json_response(503, {"error": "datadog_authorize_endpoint_not_configured"})
+
+    # API GW v2 uses rawQueryString; v1 uses queryStringParameters dict
+    raw_qs = event.get("rawQueryString") or ""
+    if raw_qs:
+        params = urllib.parse.parse_qs(raw_qs, keep_blank_values=False)
+    else:
+        qsp = event.get("queryStringParameters") or {}
+        params = {k: [v] for k, v in qsp.items()}
+
+    params.pop("scope", None)
+    flat = {k: v[0] for k, v in params.items()}
+    redirect_url = f"{target}?{urllib.parse.urlencode(flat)}"
+    print(f"[DATADOG-AUTHORIZE] redirecting (scope stripped) to {target}")
+    return {"statusCode": 302, "headers": {"Location": redirect_url}, "body": ""}
+
+
+def handle_datadog_token(event):
+    """Relay token requests to Datadog's token endpoint, stripping client_secret.
+
+    AgentCore's CustomOauth2 always sends client_secret via client_secret_post,
+    but Datadog MCP is a public client (PKCE-only). We strip client_secret so
+    Datadog authenticates the request via the PKCE code_verifier alone.
+    """
+    target = DATADOG_TOKEN_ENDPOINT
+    if not target:
+        return json_response(503, {"error": "datadog_token_endpoint_not_configured"})
+
+    body_raw = event.get("body", "") or ""
+    if event.get("isBase64Encoded") and body_raw:
+        body_raw = base64.b64decode(body_raw).decode()
+
+    # Parse form-encoded body, drop client_secret
+    params = urllib.parse.parse_qs(body_raw, keep_blank_values=True)
+    params.pop("client_secret", None)
+    # Flatten: parse_qs returns lists
+    flat = {k: v[0] for k, v in params.items()}
+    forwarded_body = urllib.parse.urlencode(flat).encode()
+
+    print(f"[DATADOG-TOKEN] forwarding token request, params={list(flat.keys())}")
+
+    req = urllib.request.Request(
+        target,
+        data=forwarded_body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_body = resp.read().decode()
+            print(f"[DATADOG-TOKEN] upstream status={resp.status}")
+            return {"statusCode": resp.status,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": resp_body}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode()
+        print(f"[DATADOG-TOKEN] upstream error {e.code}: {err_body}")
+        return {"statusCode": e.code,
+                "headers": {"Content-Type": "application/json"},
+                "body": err_body}
+    except Exception as e:
+        print(f"[DATADOG-TOKEN] exception {type(e).__name__}: {e}")
+        return json_response(502, {"error": str(e)})
+
+
 def proxy_to_gateway(event):
     """Forward MCP requests to AgentCore Gateway."""
     method = (
@@ -857,6 +953,27 @@ def proxy_to_gateway(event):
             }
     except urllib.error.HTTPError as e:
         error_body = e.read().decode()
+
+        # Convert 403 on initialize to 401 + WWW-Authenticate so MCP clients
+        # trigger step-up re-authorization (Claude Desktop/Code bug #44652:
+        # 403 insufficient_scope does not re-trigger the auth flow, but 401 does).
+        if e.code == 403 and mcp_method == "initialize":
+            audit_log(
+                action="mcp_proxy",
+                correlation_id=correlation_id,
+                caller=caller,
+                status=401,
+                detail="rewriting 403 on initialize to 401 for step-up re-auth",
+            )
+            return {
+                "statusCode": 401,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "WWW-Authenticate": 'Bearer error="insufficient_scope"',
+                },
+                "body": error_body,
+            }
+
         audit_log(
             action="mcp_proxy",
             correlation_id=correlation_id,
@@ -967,7 +1084,8 @@ def _cache_elicitation_token(resp_body, auth_header):
         print(f"[CACHE] put_item failed: {e}")
 
 
-def _get_cached_token(session_uri):
+def _get_cached_entry(session_uri):
+    """Return the DynamoDB item for session_uri, or None on miss/error."""
     if not SESSION_TABLE_NAME or not session_uri:
         return None
     try:
@@ -976,11 +1094,17 @@ def _get_cached_token(session_uri):
         item = resp.get("Item")
         if item:
             print(f"[CACHE] hit for session: {session_uri[:80]}")
-            return item.get("userToken")
+            return item
         print(f"[CACHE] miss for session: {session_uri[:80]}")
     except Exception as e:
         print(f"[CACHE] get_item failed: {e}")
     return None
+
+
+def _get_cached_token(session_uri):
+    """Compatibility wrapper — returns userToken string or None."""
+    entry = _get_cached_entry(session_uri)
+    return entry.get("userToken") if entry else None
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────

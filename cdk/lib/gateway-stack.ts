@@ -28,7 +28,7 @@ import * as os from 'os'
 import * as path from 'path'
 import * as yaml from 'js-yaml'
 import { Construct } from 'constructs'
-import { GitHubCredentialProviderConstruct, NotionCredentialProviderConstruct, SlackCredentialProviderConstruct } from './constructs-3lo'
+import { GitHubCredentialProviderConstruct, NotionCredentialProviderConstruct, SlackCredentialProviderConstruct, DatadogCredentialProviderConstruct } from './constructs-3lo'
 import { ApiKeyInterceptorLambdaConstruct, RedashInstanceConstruct } from './constructs-apikey'
 import { AdminTablesConstruct, CognitoAdminGroupConstruct, AdminApiConstruct, AdminFrontendConstruct } from './constructs-admin'
 import { CognitoCallbackRegistration } from './constructs/cognito-callback-registration'
@@ -48,6 +48,10 @@ export interface GatewayStackProps extends cdk.StackProps {
   // ── Slack 3LO (optional) ──
   readonly slackClientId?: string
   readonly slackClientSecret?: string
+  // ── Datadog 3LO (optional) ──
+  readonly datadogClientId?: string
+  /** MCP host for the Datadog site. Default: "mcp.datadoghq.com" (US1). AP1: "mcp.ap1.datadoghq.com" */
+  readonly datadogMcpHost?: string
   // ── GitHub bot (PAT-injection proxy, optional) ──
   /** GitHub bot PAT. When set, the github-bot target + IAM-protected proxy route are deployed. */
   readonly githubBotPat?: string
@@ -67,6 +71,7 @@ export class GatewayStack extends cdk.Stack {
     const hasGithub = !!(props.githubClientId && props.githubClientSecret)
     const hasNotion = !!(props.notionClientId && props.notionClientSecret)
     const hasSlack = !!(props.slackClientId && props.slackClientSecret)
+    const hasDatadog = !!props.datadogClientId
     const hasGithubBot = !!props.githubBotPat
     const useRedash = props.deployRedash || !!props.redashUrl
 
@@ -484,6 +489,10 @@ export class GatewayStack extends cdk.Stack {
     // Created after httpApi because it needs the proxy URL for scope rewriting
     let slackProvider: SlackCredentialProviderConstruct | undefined
 
+    // ── Datadog Credential Provider ──
+    // Created after httpApi so tokenEndpointOverride can reference httpApi.apiEndpoint.
+    let datadogProvider: DatadogCredentialProviderConstruct | undefined
+
     // ══════════════════════════════════════════════════════════════════════
     // OAuth Proxy (HTTP API + Lambda + DynamoDB)
     // ══════════════════════════════════════════════════════════════════════
@@ -520,6 +529,11 @@ export class GatewayStack extends cdk.Stack {
     }
     if (githubBotPatSecret) {
       proxyEnvironment.GITHUB_BOT_PAT_SECRET_ARN = githubBotPatSecret.secretArn
+    }
+    if (hasDatadog) {
+      const ddMcpHost = props.datadogMcpHost ?? 'mcp.datadoghq.com'
+      proxyEnvironment.DATADOG_TOKEN_ENDPOINT = `https://${ddMcpHost}/api/unstable/mcp-server/token`
+      proxyEnvironment.DATADOG_AUTHORIZE_ENDPOINT = `https://${ddMcpHost}/api/unstable/mcp-server/authorize`
     }
 
     const proxyLambda = new lambda.Function(this, 'ProxyLambda', {
@@ -583,6 +597,19 @@ export class GatewayStack extends cdk.Stack {
           uniqueId: 'slack',
           clientId: props.slackClientId!,
           clientSecret: props.slackClientSecret!,
+        },
+      )
+    }
+
+    // ── Datadog Credential Provider (needs proxy URL for token relay) ──
+    if (hasDatadog) {
+      datadogProvider = new DatadogCredentialProviderConstruct(
+        this, 'DatadogProvider', {
+          uniqueId: 'datadog',
+          clientId: props.datadogClientId!,
+          mcpHost: props.datadogMcpHost,
+          tokenEndpointOverride: `${httpApi.apiEndpoint}/datadog-token`,
+          issuerOverride: httpApi.apiEndpoint,
         },
       )
     }
@@ -706,6 +733,14 @@ export class GatewayStack extends cdk.Stack {
       new cdk.CfnOutput(this, 'GitHubBotPatSecretArn', {
         value: githubBotPatSecret.secretArn,
         description: 'Bot PAT secret (seeded at deploy from GITHUB_BOT_PAT)',
+      })
+    }
+    if (datadogProvider) {
+      new cdk.CfnOutput(this, 'DatadogCredentialProviderName', {
+        value: datadogProvider.credentialProviderName,
+      })
+      new cdk.CfnOutput(this, 'DatadogCredentialProviderArn', {
+        value: datadogProvider.credentialProviderArn,
       })
     }
   }

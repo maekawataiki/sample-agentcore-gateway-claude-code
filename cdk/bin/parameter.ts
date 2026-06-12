@@ -35,6 +35,10 @@ const ParameterSchema = z.object({
   slackClientId: z.string().optional(),
   slackClientSecret: z.string().optional(),
 
+  // ── Datadog 3LO (optional) ──
+  datadogClientId: z.string().optional(),
+  datadogMcpHost: z.string().optional(),
+
   // ── GitHub bot (PAT-injection proxy, optional) ──
   githubBotPat: z.string().optional(),
 }).refine(
@@ -64,5 +68,7 @@ export const params: Parameters = ParameterSchema.parse({
   notionClientSecret: process.env.NOTION_OAUTH_CLIENT_SECRET || undefined,
   slackClientId: process.env.SLACK_OAUTH_CLIENT_ID || undefined,
   slackClientSecret: process.env.SLACK_OAUTH_CLIENT_SECRET || undefined,
+  datadogClientId: process.env.DATADOG_OAUTH_CLIENT_ID || undefined,
+  datadogMcpHost: process.env.DATADOG_MCP_HOST || 'mcp.ap1.datadoghq.com',
   githubBotPat: process.env.GITHUB_BOT_PAT || undefined,
 })
