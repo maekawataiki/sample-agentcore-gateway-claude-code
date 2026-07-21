@@ -2,6 +2,7 @@
 import * as cdk from 'aws-cdk-lib'
 import { CognitoStack } from '../lib/cognito-stack'
 import { GatewayStack } from '../lib/gateway-stack'
+import { FirebaseMcpRuntimeStack } from '../lib/firebase-mcp-runtime-stack'
 import { params } from './parameter'
 
 const app = new cdk.App()
@@ -29,12 +30,20 @@ new GatewayStack(app, 'GatewayStack', {
   datadogClientId: params.datadogClientId,
   datadogMcpHost: params.datadogMcpHost,
   githubBotPat: params.githubBotPat,
+  firebaseRuntimeStackName: 'FirebaseMcpRuntimeStack',
   deployRedash: params.deployRedash,
   redashUrl: params.redashUrl,
   redashHostedZoneName: params.redashHostedZoneName,
   redashRecordName: params.redashRecordName,
   env,
   description: 'Unified MCP Gateway — GitHub, Notion, Redash via single endpoint',
+})
+
+new FirebaseMcpRuntimeStack(app, 'FirebaseMcpRuntimeStack', {
+  discoveryUrl: cognito.discoveryUrl,
+  cognitoClientId: cognito.appClientId,
+  env,
+  description: 'Independent Firebase CLI MCP endpoint backed by AgentCore Runtime',
 })
 
 app.synth()

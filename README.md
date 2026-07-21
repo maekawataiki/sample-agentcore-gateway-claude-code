@@ -65,6 +65,7 @@ Claude Code ──► API Gateway (HTTP API)
 |-------|-------------|
 | `CognitoStack` | Shared Cognito User Pool + App Client (us-east-1) |
 | `GatewayStack` | Unified Gateway + Redash target + OAuth Proxy + API-key Interceptor + Admin Panel (API + SPA) |
+| `FirebaseMcpRuntimeStack` | Independent AgentCore Runtime endpoint that bridges the stdio-only Firebase CLI MCP server. Uses a GCP service account key stored in Secrets Manager for authentication |
 
 > GitHub / Notion / Slack targets are **MCP server targets** (not OpenAPI), created outside CloudFormation by `bin/sync-mcp-targets.py` — CFN cannot handle Authorization Code-grant MCP targets (creation needs interactive OAuth consent). The optional `github-bot` target (machine-to-machine PAT) is created the same way. The Redash target remains an OpenAPI target created by CDK.
 
@@ -106,6 +107,9 @@ If a required field is missing or a client ID is set without its secret, `cdk sy
 
 ### 0. Create OAuth Apps (optional, enables 3LO targets)
 
+<details>
+<summary>GitHub OAuth App + Notion DCR setup</summary>
+
 #### GitHub OAuth App
 
 1. Go to [GitHub Developer Settings > OAuth Apps](https://github.com/settings/developers)
@@ -140,6 +144,8 @@ bin/register-notion-dcr.sh --env .env
 
 > **Why not the Notion Developer Dashboard?** The Notion Developer Dashboard issues credentials for `api.notion.com` (the Data API). Notion's MCP server at `mcp.notion.com` runs a separate OAuth 2.1 authorization server and only accepts clients registered via its own DCR endpoint.
 
+</details>
+
 ### 1. Set OAuth secrets (optional, enables 3LO targets)
 
 
@@ -164,6 +170,71 @@ pnpm deploy             # builds frontend → cdk deploy GatewayStack
 ```
 
 `pnpm deploy` builds the Admin Panel frontend (`frontend/`) and deploys `GatewayStack` in one step. Use `pnpm deploy:all` to deploy every stack (`CognitoStack` + `GatewayStack`).
+
+### Firebase CLI MCP Runtime
+
+<details>
+<summary>Setup instructions (GCP service account + Secrets Manager)</summary>
+
+The Firebase CLI MCP server is stdio-only, so it is deployed separately from
+the Gateway as an AgentCore Runtime. A GCP service account key stored in
+Secrets Manager provides authentication to Firebase/GCP APIs.
+
+> **Why not Workload Identity Federation?** AgentCore Runtime's IMDS credentials
+> are scoped internally and cannot be replayed by external services (GCP STS
+> returns `InvalidClientTokenId`). A service account key is the simplest
+> reliable approach.
+
+#### Prerequisites
+
+1. Create a GCP service account with minimal permissions:
+   ```bash
+   gcloud iam service-accounts create firebase-mcp-runtime \
+     --project=<gcp-project-id>
+   
+   gcloud projects add-iam-policy-binding <gcp-project-id> \
+     --member="serviceAccount:firebase-mcp-runtime@<gcp-project-id>.iam.gserviceaccount.com" \
+     --role="roles/firebase.admin"
+   
+   gcloud projects add-iam-policy-binding <gcp-project-id> \
+     --member="serviceAccount:firebase-mcp-runtime@<gcp-project-id>.iam.gserviceaccount.com" \
+     --role="roles/serviceusage.serviceUsageConsumer"
+   ```
+
+2. Create a key and store in Secrets Manager:
+   ```bash
+   gcloud iam service-accounts keys create /tmp/sa-key.json \
+     --iam-account=firebase-mcp-runtime@<gcp-project-id>.iam.gserviceaccount.com
+
+   SA_KEY_ARN=$(aws secretsmanager create-secret \
+     --name firebase-mcp/gcp-service-account-key \
+     --secret-string file:///tmp/sa-key.json \
+     --region us-east-1 --query ARN --output text)
+   
+   rm /tmp/sa-key.json
+   echo "Secret ARN: $SA_KEY_ARN"
+   ```
+
+3. Enable the Developer Knowledge API (for doc search):
+   ```bash
+   gcloud services enable developerknowledge.googleapis.com --project=<gcp-project-id>
+   ```
+
+#### Deploy
+
+```bash
+pnpm --filter mcp-3lo-runtime-stack exec cdk deploy FirebaseMcpRuntimeStack \
+  --require-approval never \
+  --parameters FirebaseMcpRuntimeStack:GcpSaKeySecretArn=<secret-arn>
+```
+
+</details>
+
+The stack output `FirebaseMcpRuntimeEndpointArn` identifies the stable,
+JWT-protected Runtime endpoint. It is deliberately separate from
+`GatewayStack`; its caller must present a JWT issued for the shared Cognito app
+client. Configure the client with the AgentCore Runtime invocation endpoint
+using that ARN, URL-encoded as required by the AgentCore Runtime API.
 
 After the stack is up, register GitHub / Notion MCP server targets (skip if not using 3LO):
 
@@ -350,6 +421,9 @@ Runs [cdk-nag](https://github.com/cdklabs/cdk-nag) AwsSolutions checks against b
 
 ## Troubleshooting
 
+<details>
+<summary>Common issues and fixes</summary>
+
 ### "Invalid or expired session" on 3LO callback
 - Check DynamoDB session table (TTL: 10 min)
 - Verify `defaultReturnUrl` points to `<PROXY_URL>/3lo-callback`
@@ -375,6 +449,8 @@ Runs [cdk-nag](https://github.com/cdklabs/cdk-nag) AwsSolutions checks against b
 - Discovery hits GitHub with the seeded PAT, so `GITHUB_BOT_PAT` must be a valid GitHub PAT: `curl -H "Authorization: Bearer $GITHUB_BOT_PAT" https://api.github.com/user` (expect 200)
 - After fixing: redeploy, then `python3 bin/sync-mcp-targets.py delete github-bot && python3 bin/sync-mcp-targets.py create github-bot`
 - A direct (unsigned) call to `/github-mcp` returns 403 by design — only the gateway (SigV4) can reach it
+
+</details>
 
 ## Observability
 

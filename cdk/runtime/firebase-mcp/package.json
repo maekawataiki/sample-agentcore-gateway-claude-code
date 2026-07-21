@@ -1,0 +1,8 @@
+{
+  "name": "firebase-agentcore-mcp-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.24.0"
+  }
+}

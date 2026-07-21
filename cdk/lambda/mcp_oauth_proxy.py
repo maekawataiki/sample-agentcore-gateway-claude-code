@@ -39,6 +39,8 @@ SESSION_TABLE_NAME = os.environ.get("SESSION_TABLE_NAME", "")
 GITHUB_BOT_PAT_SECRET_ARN = os.environ.get("GITHUB_BOT_PAT_SECRET_ARN", "")
 DATADOG_TOKEN_ENDPOINT = os.environ.get("DATADOG_TOKEN_ENDPOINT", "")
 DATADOG_AUTHORIZE_ENDPOINT = os.environ.get("DATADOG_AUTHORIZE_ENDPOINT", "")
+FIREBASE_RUNTIME_ENDPOINT_ARN = os.environ.get("FIREBASE_RUNTIME_ENDPOINT_ARN", "")
+ADMIN_TABLE_NAME = os.environ.get("ADMIN_TABLE_NAME", "")
 
 # Allowed redirect_uri hosts for OAuth callback (prevent open redirect)
 _ALLOWED_REDIRECT_HOSTS = {"127.0.0.1", "localhost"}
@@ -115,10 +117,7 @@ def lambda_handler(event, context):
     # ── OAuth metadata ──
     if path.startswith("/.well-known/oauth-authorization-server"):
         return handle_oauth_metadata(event)
-    if path in (
-        "/.well-known/oauth-protected-resource",
-        "/.well-known/oauth-protected-resource/mcp",
-    ):
+    if path.startswith("/.well-known/oauth-protected-resource"):
         return handle_protected_resource_metadata(event)
 
     # ── OAuth flow ──
@@ -150,6 +149,14 @@ def lambda_handler(event, context):
     # from Secrets Manager.
     if path.startswith("/github-mcp"):
         return handle_github_mcp(event)
+
+    # ── Firebase MCP relay (AgentCore Runtime invocation via SigV4) ──
+    # The Firebase CLI MCP server runs as an AgentCore Runtime container.
+    # Claude Code cannot call the Runtime invocation endpoint directly
+    # because it requires SigV4 and does not serve OAuth metadata. This
+    # route forwards MCP requests with the user's JWT attached.
+    if path.startswith("/firebase-mcp"):
+        return handle_firebase_mcp(event)
 
     # ── Datadog token relay ──
     # Datadog MCP is a public OAuth client (PKCE-only, no client_secret).
@@ -190,10 +197,22 @@ def handle_oauth_metadata(event):
 
 
 def handle_protected_resource_metadata(event):
-    """Serve OAuth Protected Resource Metadata (RFC 9728)."""
+    """Serve OAuth Protected Resource Metadata (RFC 9728).
+
+    The `resource` field must match the URL the client connects to.
+    We derive it from the request path:
+      /.well-known/oauth-protected-resource         → resource = <api>/mcp
+      /.well-known/oauth-protected-resource/mcp     → resource = <api>/mcp
+      /.well-known/oauth-protected-resource/firebase-mcp → resource = <api>/firebase-mcp
+    """
     api_url = get_api_url(event)
+    path = event.get("path", "") or event.get("rawPath", "/")
+    # Extract the resource path suffix after the well-known prefix
+    prefix = "/.well-known/oauth-protected-resource"
+    suffix = path[len(prefix):].lstrip("/") if path.startswith(prefix) else ""
+    resource_path = suffix if suffix else "mcp"
     return json_response(200, {
-        "resource": f"{api_url}/mcp",
+        "resource": f"{api_url}/{resource_path}",
         "authorization_servers": [api_url],
         "bearer_methods_supported": ["header"],
     })
@@ -770,6 +789,291 @@ def handle_github_mcp(event):
         print(f"[GITHUB-MCP] upstream exception {type(e).__name__}: {e}")
         return {"statusCode": 502, "headers": {"Content-Type": "application/json"},
                 "body": json.dumps({"error": str(e)})}
+
+
+# ─── Firebase MCP Runtime relay (JWT passthrough) ──────────────────────────
+
+
+def _resolve_firebase_credentials(auth_header):
+    """Resolve per-user GCP credentials from Admin Table by JWT claims.
+
+    Follows the same priority as the API key interceptor:
+      email > cognito:groups > * (wildcard default)
+
+    Returns the credentials string (SA key JSON) or None if not found.
+    """
+    if not ADMIN_TABLE_NAME or not auth_header:
+        return None
+
+    # Decode JWT claims (no verification - already verified by gateway/runtime)
+    try:
+        token = auth_header.replace("Bearer ", "").replace("bearer ", "")
+        payload = token.split(".")[1]
+        payload += "=" * (4 - len(payload) % 4)
+        claims = json.loads(base64.b64decode(payload))
+    except Exception:
+        return None
+
+    # Build ordered candidate list
+    candidates = []
+    email = claims.get("email")
+    if email:
+        candidates.append(("email", email))
+    groups = claims.get("cognito:groups", [])
+    if isinstance(groups, str):
+        groups = [g.strip() for g in groups.split(",") if g.strip()]
+    for g in groups:
+        candidates.append(("cognito:groups", g))
+    candidates.append(("*", "*"))
+
+    # BatchGetItem from DynamoDB
+    service = "firebase"
+    keys = [{"PK": {"S": f"SVC#{service}"}, "SK": {"S": f"CLAIM#{k}#{v}"}} for k, v in candidates]
+
+    try:
+        dynamodb = boto3.client("dynamodb", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+        resp = dynamodb.batch_get_item(
+            RequestItems={ADMIN_TABLE_NAME: {"Keys": keys}}
+        )
+        items = resp.get("Responses", {}).get(ADMIN_TABLE_NAME, [])
+    except Exception as e:
+        print(f"[FIREBASE-MCP] DynamoDB lookup error: {e}")
+        return None
+
+    if not items:
+        return None
+
+    # Return first match in priority order
+    item_map = {item["SK"]["S"]: item for item in items}
+    for k, v in candidates:
+        sk = f"CLAIM#{k}#{v}"
+        if sk in item_map:
+            return item_map[sk].get("apiKey", {}).get("S")
+
+    return None
+
+
+def handle_firebase_mcp(event):
+    """Forward MCP requests to the Firebase AgentCore Runtime endpoint.
+
+    The Runtime is configured with CUSTOM_JWT (Cognito) inbound auth, so we
+    pass the caller's JWT as a Bearer token — no SigV4 needed. The invocation
+    URL follows the AgentCore Runtime pattern:
+      POST https://bedrock-agentcore.{region}.amazonaws.com/runtimes/{url-encoded-runtime-arn}/invocations?qualifier={endpoint-name}
+    """
+    if not FIREBASE_RUNTIME_ENDPOINT_ARN:
+        return json_response(503, {"error": "firebase_runtime_endpoint_not_configured"})
+
+    method = (
+        event.get("httpMethod")
+        or event.get("requestContext", {}).get("http", {}).get("method", "POST")
+    )
+    body = event.get("body", "")
+    if event.get("isBase64Encoded") and body:
+        body = base64.b64decode(body)
+
+    headers_in = event.get("headers") or {}
+    auth = headers_in.get("authorization") or headers_in.get("Authorization") or ""
+
+    # Parse the endpoint ARN to extract runtime ARN and endpoint name.
+    # Endpoint ARN: arn:aws:bedrock-agentcore:{region}:{account}:runtime/{runtimeId}/runtime-endpoint/{endpointName}
+    # We need runtime ARN (without /runtime-endpoint/...) and the endpoint name as qualifier.
+    import re as _re
+    m = _re.match(
+        r"(arn:aws:bedrock-agentcore:[^:]+:[^:]+:runtime/[^/]+)/runtime-endpoint/(.+)",
+        FIREBASE_RUNTIME_ENDPOINT_ARN,
+    )
+    if m:
+        runtime_arn = m.group(1)
+        qualifier = m.group(2)
+    else:
+        # Fallback: assume it's already a runtime ARN, use DEFAULT qualifier
+        runtime_arn = FIREBASE_RUNTIME_ENDPOINT_ARN
+        qualifier = "DEFAULT"
+
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    encoded_arn = urllib.parse.quote(runtime_arn, safe="")
+    runtime_url = f"https://bedrock-agentcore.{region}.amazonaws.com/runtimes/{encoded_arn}/invocations?qualifier={qualifier}"
+
+    # Prepare headers — JWT-only auth (no SigV4)
+    fwd_headers = {
+        "Content-Type": headers_in.get("content-type") or headers_in.get("Content-Type") or "application/json",
+        "Accept": headers_in.get("accept") or headers_in.get("Accept") or "application/json, text/event-stream",
+    }
+    if auth:
+        fwd_headers["Authorization"] = auth
+
+    # Resolve per-user GCP credentials from Admin Table
+    user_creds = _resolve_firebase_credentials(auth)
+    if user_creds:
+        fwd_headers["X-Gcp-Credentials"] = base64.b64encode(user_creds.encode()).decode()
+
+    for h in ("mcp-protocol-version", "mcp-session-id"):
+        v = headers_in.get(h) or headers_in.get(h.title())
+        if v:
+            fwd_headers[h.title()] = v
+
+    data = body.encode() if isinstance(body, str) else (body or b"")
+
+    try:
+        req = urllib.request.Request(runtime_url, data=data, method="POST")
+        for k, v in fwd_headers.items():
+            req.add_header(k, v)
+
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            resp_body = resp.read().decode()
+            content_type = resp.headers.get("Content-Type", "application/json")
+            resp_headers = {"Content-Type": content_type}
+            sid = resp.headers.get("Mcp-Session-Id")
+            if sid:
+                resp_headers["Mcp-Session-Id"] = sid
+
+            # If the Runtime returns SSE (text/event-stream), extract the JSON
+            # payload and return it as application/json. Lambda + API Gateway
+            # cannot stream SSE back to the client, and Claude Code expects
+            # plain JSON from non-streaming endpoints.
+            if "text/event-stream" in content_type:
+                json_payload = _extract_json_from_sse(resp_body)
+                if json_payload:
+                    resp_body = json_payload
+                    resp_headers["Content-Type"] = "application/json"
+
+            # Normalize inputSchema in tools/list responses
+            resp_body = _normalize_tools_schema(resp_body)
+
+            # Ensure protocolVersion in initialize response matches what
+            # Claude Code expects.
+            resp_body = _normalize_protocol_version(resp_body)
+
+            # DEBUG: log first 2000 chars of response for tools/list diagnostics
+            try:
+                _parsed = json.loads(resp_body)
+                _method = _parsed.get("result", {}).get("protocolVersion") or ""
+                _tools = _parsed.get("result", {}).get("tools")
+                if _method:
+                    print(f"[FIREBASE-MCP-DEBUG] initialize protocolVersion={_method}")
+                if _tools is not None:
+                    print(f"[FIREBASE-MCP-DEBUG] tools/list count={len(_tools)} first_tool={json.dumps(_tools[0])[:500] if _tools else 'empty'}")
+            except Exception:
+                print(f"[FIREBASE-MCP-DEBUG] raw response: {resp_body[:1000]}")
+
+            return {"statusCode": resp.status, "headers": resp_headers, "body": resp_body}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode()
+        print(f"[FIREBASE-MCP] Runtime error {e.code}: {err_body[:500]}")
+        resp_headers = {"Content-Type": e.headers.get("Content-Type", "application/json")}
+        sid = e.headers.get("Mcp-Session-Id")
+        if sid:
+            resp_headers["Mcp-Session-Id"] = sid
+        return {"statusCode": e.code, "headers": resp_headers, "body": err_body}
+    except Exception as e:
+        print(f"[FIREBASE-MCP] exception {type(e).__name__}: {e}")
+        return {"statusCode": 502, "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({"error": str(e)})}
+
+
+def _normalize_protocol_version(resp_body):
+    """Ensure the initialize response uses the protocol version that Claude Code expects.
+
+    Handles both plain JSON and SSE (data: {...}) formats.
+    """
+    body, is_sse = _unwrap_sse(resp_body)
+    try:
+        msg = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return resp_body
+
+    if not isinstance(msg, dict):
+        return resp_body
+
+    result = msg.get("result")
+    if not isinstance(result, dict):
+        return resp_body
+
+    pv = result.get("protocolVersion")
+    if pv and pv != "2025-11-25":
+        result["protocolVersion"] = "2025-11-25"
+        return _rewrap_sse(json.dumps(msg), is_sse)
+
+    return resp_body
+
+
+def _normalize_tools_schema(resp_body):
+    """Ensure every tool in a tools/list response has a valid inputSchema.
+
+    Handles both plain JSON and SSE (data: {...}) formats.
+    """
+    body, is_sse = _unwrap_sse(resp_body)
+    try:
+        msg = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return resp_body
+
+    tools = None
+    if isinstance(msg, dict):
+        result = msg.get("result")
+        if isinstance(result, dict):
+            tools = result.get("tools")
+
+    if not tools or not isinstance(tools, list):
+        return resp_body
+
+    modified = False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        schema = tool.get("inputSchema")
+        if schema is None or not isinstance(schema, dict):
+            tool["inputSchema"] = {"type": "object", "properties": {}}
+            modified = True
+        else:
+            if "type" not in schema:
+                schema["type"] = "object"
+                modified = True
+            if "properties" not in schema and schema.get("type") == "object":
+                schema["properties"] = {}
+                modified = True
+            if "$schema" in schema:
+                del schema["$schema"]
+                modified = True
+
+    return _rewrap_sse(json.dumps(msg), is_sse) if modified else resp_body
+
+
+def _unwrap_sse(resp_body):
+    """Extract JSON from SSE 'data: {...}' format. Returns (json_str, is_sse)."""
+    stripped = resp_body.strip()
+    if stripped.startswith("data:"):
+        # May have multiple data: lines; take the first one with JSON content
+        for line in stripped.splitlines():
+            if line.startswith("data:"):
+                payload = line[5:].strip()
+                if payload:
+                    return payload, True
+        return stripped, False
+    return resp_body, False
+
+
+def _extract_json_from_sse(sse_body):
+    """Extract the last JSON-RPC message from an SSE stream.
+
+    SSE format: "data: {...}\n\n" possibly with multiple events.
+    Returns the JSON string of the last data event, or None if parsing fails.
+    """
+    last_payload = None
+    for line in sse_body.splitlines():
+        if line.startswith("data:"):
+            payload = line[5:].strip()
+            if payload:
+                last_payload = payload
+    return last_payload
+
+
+def _rewrap_sse(json_str, is_sse):
+    """Re-wrap JSON into SSE format if it was originally SSE."""
+    if is_sse:
+        return f"data: {json_str}\n\n"
+    return json_str
 
 
 def handle_datadog_authorize(event):

@@ -55,6 +55,9 @@ export interface GatewayStackProps extends cdk.StackProps {
   // ── GitHub bot (PAT-injection proxy, optional) ──
   /** GitHub bot PAT. When set, the github-bot target + IAM-protected proxy route are deployed. */
   readonly githubBotPat?: string
+  // ── Firebase MCP Runtime (optional) ──
+  /** FirebaseMcpRuntimeStack name. When set, /firebase-mcp proxy route resolves the endpoint ARN via Fn::GetStackOutput. */
+  readonly firebaseRuntimeStackName?: string
   // ── Redash / API Key Swap ──
   readonly deployRedash?: boolean
   readonly redashUrl?: string
@@ -73,6 +76,7 @@ export class GatewayStack extends cdk.Stack {
     const hasSlack = !!(props.slackClientId && props.slackClientSecret)
     const hasDatadog = !!props.datadogClientId
     const hasGithubBot = !!props.githubBotPat
+    const hasFirebase = !!props.firebaseRuntimeStackName
     const useRedash = props.deployRedash || !!props.redashUrl
 
     // ══════════════════════════════════════════════════════════════════════
@@ -535,6 +539,20 @@ export class GatewayStack extends cdk.Stack {
       proxyEnvironment.DATADOG_TOKEN_ENDPOINT = `https://${ddMcpHost}/api/unstable/mcp-server/token`
       proxyEnvironment.DATADOG_AUTHORIZE_ENDPOINT = `https://${ddMcpHost}/api/unstable/mcp-server/authorize`
     }
+    if (hasFirebase) {
+      // Resolve the Runtime endpoint ARN via Fn::GetStackOutput (weak reference).
+      // No Export needed on FirebaseMcpRuntimeStack — just reads the CfnOutput at deploy time.
+      // aws-cdk-lib doesn't have a high-level Fn.getStackOutput() yet, so we use
+      // a raw CloudFormation intrinsic token.
+      const firebaseEndpointArn = cdk.Token.asString({
+        'Fn::GetStackOutput': {
+          StackName: props.firebaseRuntimeStackName!,
+          OutputName: 'FirebaseMcpRuntimeEndpointArn',
+        },
+      })
+      proxyEnvironment.FIREBASE_RUNTIME_ENDPOINT_ARN = firebaseEndpointArn
+      proxyEnvironment.ADMIN_TABLE_NAME = adminTables.table.tableName
+    }
 
     const proxyLambda = new lambda.Function(this, 'ProxyLambda', {
       functionName: `oauth-proxy-${this.stackName}`,
@@ -564,6 +582,18 @@ export class GatewayStack extends cdk.Stack {
       resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`],
     }))
     sessionTable.grantReadWriteData(proxyLambda)
+    // Allow reading Admin Table for per-user Firebase credential resolution
+    if (hasFirebase) {
+      adminTables.table.grantReadData(proxyLambda)
+    }
+
+    // Allow invoking the Firebase Runtime endpoint (SigV4)
+    if (hasFirebase) {
+      proxyLambda.addToRolePolicy(new iam.PolicyStatement({
+        actions: ['bedrock-agentcore:InvokeAgentRuntime'],
+        resources: [`arn:aws:bedrock-agentcore:${this.region}:${this.account}:runtime/*`],
+      }))
+    }
 
     // No CORS preflight — MCP clients (Claude Code, VS Code) are not browsers.
     // The OAuth Proxy Lambda handles OPTIONS directly if needed.
@@ -578,6 +608,8 @@ export class GatewayStack extends cdk.Stack {
     const iamAuthorizer = new HttpIamAuthorizer()
     httpApi.addRoutes({ path: '/github-mcp', methods: [apigwv2.HttpMethod.ANY], integration, authorizer: iamAuthorizer })
     httpApi.addRoutes({ path: '/github-mcp/{proxy+}', methods: [apigwv2.HttpMethod.ANY], integration, authorizer: iamAuthorizer })
+    httpApi.addRoutes({ path: '/firebase-mcp', methods: [apigwv2.HttpMethod.ANY], integration })
+    httpApi.addRoutes({ path: '/firebase-mcp/{proxy+}', methods: [apigwv2.HttpMethod.ANY], integration })
     httpApi.addRoutes({ path: '/{proxy+}', methods: [apigwv2.HttpMethod.ANY], integration })
     httpApi.addRoutes({ path: '/', methods: [apigwv2.HttpMethod.ANY], integration })
 
